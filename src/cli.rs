@@ -9,13 +9,13 @@ use std::path::{Path, PathBuf};
 use crate::engine::{self, FileDiff, Ignore, LineKind, Node, Status};
 
 pub const USAGE: &str = "\
-dircmp - compare two directories in the terminal
+dirrcmp - compare two directories in the terminal
 
 USAGE:
-    dircmp [OPTIONS] <LEFT> <RIGHT>          interactive TUI (two directories)
-    dircmp [OPTIONS] <FILE1> <FILE2>         side-by-side editor (two files; unified diff if piped)
-    dircmp diff  [OPTIONS] <LEFT> <RIGHT>    print differences
-    dircmp check [OPTIONS] <LEFT> <RIGHT>    silent; exit 0 if identical, 1 if different
+    dirrcmp [OPTIONS] <LEFT> <RIGHT>          interactive TUI (two directories)
+    dirrcmp [OPTIONS] <FILE1> <FILE2>         side-by-side editor (two files; unified diff if piped)
+    dirrcmp diff  [OPTIONS] <LEFT> <RIGHT>    print differences
+    dirrcmp check [OPTIONS] <LEFT> <RIGHT>    silent; exit 0 if identical, 1 if different
 
 OPTIONS:
         --no-ignore           disable all ignore patterns
@@ -34,12 +34,12 @@ OPTIONS (diff / check):
         --stat                print a summary line (to stdout; before the result for check)
 
 Ignored by default: .git, node_modules, .DS_Store.
-Extra global patterns are read from $XDG_DATA_HOME/dircmp/ignore
-(default ~/.local/share/dircmp/ignore). Patterns added in the TUI (i, I) are
+Extra global patterns are read from $XDG_DATA_HOME/dirrcmp/ignore
+(default ~/.local/share/dirrcmp/ignore). Patterns added in the TUI (i, I) are
 saved per pair of directories in the pairs/ folder next to it and also apply
 to 'diff' and 'check'.
-Preferences live in $XDG_CONFIG_HOME/dircmp/config.json (default
-~/.config/dircmp/config.json): compareDates, compareContents, dirsFirst,
+Preferences live in $XDG_CONFIG_HOME/dirrcmp/config.json (default
+~/.config/dirrcmp/config.json): compareDates, compareContents, dirsFirst,
 showHints, nerdFont, syntaxHighlight, chunkBackground, diffCommand.
 ";
 
@@ -184,12 +184,12 @@ pub fn parse_args(args: Vec<String>) -> Result<Cli, String> {
 
 pub fn data_dir() -> Option<PathBuf> {
     if let Some(x) = env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
-        return Some(PathBuf::from(x).join("dircmp"));
+        return Some(PathBuf::from(x).join("dirrcmp"));
     }
     if let Some(h) = env::var_os("HOME").filter(|v| !v.is_empty()) {
-        return Some(PathBuf::from(h).join(".local/share/dircmp"));
+        return Some(PathBuf::from(h).join(".local/share/dirrcmp"));
     }
-    env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty()).map(|a| PathBuf::from(a).join("dircmp"))
+    env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty()).map(|a| PathBuf::from(a).join("dirrcmp"))
 }
 
 /// Stable key for a pair of directories; the same for either panel order.
@@ -474,7 +474,7 @@ mod tests {
     }
 
     fn sample() -> (PathBuf, Node) {
-        let root = std::env::temp_dir().join(format!("dircmp-cli-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("dirrcmp-cli-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let (l, r) = (root.join("l"), root.join("r"));
         for (p, c) in [
@@ -529,7 +529,7 @@ mod tests {
     }
     #[test]
     fn pair_ignore_files() {
-        let root = std::env::temp_dir().join(format!("dircmp-pairs-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("dirrcmp-pairs-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let (a, b) = (root.join("a"), root.join("b"));
         fs::create_dir_all(&a).unwrap();

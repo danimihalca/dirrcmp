@@ -125,7 +125,7 @@ impl Journal {
     fn slot(&mut self) -> io::Result<PathBuf> {
         if self.dir.is_none() {
             let id = SESSION.fetch_add(1, Ordering::SeqCst);
-            let d = env::temp_dir().join(format!("dircmp-undo-{}-{}", std::process::id(), id));
+            let d = env::temp_dir().join(format!("dirrcmp-undo-{}-{}", std::process::id(), id));
             create_private_dir(&d)?;
             self.dir = Some(d);
         }
@@ -256,7 +256,7 @@ mod tests {
 
     fn tmp() -> PathBuf {
         let p = env::temp_dir()
-            .join(format!("dircmp-undotest-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
+            .join(format!("dirrcmp-undotest-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
         let _ = fs::remove_dir_all(&p);
         fs::create_dir_all(&p).unwrap();
         p

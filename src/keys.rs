@@ -644,7 +644,7 @@ mod tests {
 
     #[test]
     fn loading_the_file() {
-        let dir = std::env::temp_dir().join(format!("dircmp-keys-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("dirrcmp-keys-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         // no path / missing file: defaults, no warning

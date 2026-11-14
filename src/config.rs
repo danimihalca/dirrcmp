@@ -1,7 +1,7 @@
-//! Preferences from `config.json` (same file and keys as the original dircmp).
+//! Preferences from `config.json` (same file and keys as the original dirrcmp).
 //!
-//! Location: `$XDG_CONFIG_HOME/dircmp/config.json`, else `~/.config/dircmp/config.json`,
-//! else `%APPDATA%\dircmp\config.json` on Windows. Std only: a small JSON reader
+//! Location: `$XDG_CONFIG_HOME/dirrcmp/config.json`, else `~/.config/dirrcmp/config.json`,
+//! else `%APPDATA%\dirrcmp\config.json` on Windows. Std only: a small JSON reader
 //! that understands the flat object this file uses and skips anything else.
 
 use std::env;
@@ -46,14 +46,14 @@ impl Default for Config {
 
 pub fn config_path() -> Option<PathBuf> {
     if let Some(x) = env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
-        return Some(PathBuf::from(x).join("dircmp").join("config.json"));
+        return Some(PathBuf::from(x).join("dirrcmp").join("config.json"));
     }
     if let Some(h) = env::var_os("HOME").filter(|v| !v.is_empty()) {
-        return Some(PathBuf::from(h).join(".config").join("dircmp").join("config.json"));
+        return Some(PathBuf::from(h).join(".config").join("dirrcmp").join("config.json"));
     }
     env::var_os("APPDATA")
         .filter(|v| !v.is_empty())
-        .map(|a| PathBuf::from(a).join("dircmp").join("config.json"))
+        .map(|a| PathBuf::from(a).join("dirrcmp").join("config.json"))
 }
 
 /// Load the config. A missing file is normal (defaults, no warning). A broken
@@ -537,7 +537,7 @@ mod tests {
 
     #[test]
     fn file_loading() {
-        let dir = std::env::temp_dir().join(format!("dircmp-cfg-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("dirrcmp-cfg-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         // missing: defaults, no warning
@@ -584,7 +584,7 @@ mod save_tests {
 
     #[test]
     fn save_creates_directories() {
-        let dir = std::env::temp_dir().join(format!("dircmp-cfg-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("dirrcmp-cfg-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let p = dir.join("a/b/config.json");
         save_to(&p, &Config::default()).unwrap();

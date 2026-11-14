@@ -24,7 +24,7 @@ fn run() -> i32 {
     let c = match cli::parse_args(args) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("dircmp: {e}\nTry 'dircmp --help'.");
+            eprintln!("dirrcmp: {e}\nTry 'dirrcmp --help'.");
             return 2;
         }
     };
@@ -34,7 +34,7 @@ fn run() -> i32 {
             return 0;
         }
         Command::Version => {
-            println!("dircmp {}", env!("CARGO_PKG_VERSION"));
+            println!("dirrcmp {}", env!("CARGO_PKG_VERSION"));
             return 0;
         }
         _ => {}
@@ -56,7 +56,7 @@ fn run() -> i32 {
                     return 1;
                 }
                 Err(e) => {
-                    eprintln!("dircmp: {e}");
+                    eprintln!("dirrcmp: {e}");
                     return 1;
                 }
             }
@@ -67,7 +67,7 @@ fn run() -> i32 {
     }
     if !left.is_dir() || !right.is_dir() {
         eprintln!(
-            "dircmp: both arguments must be directories (or both files); \
+            "dirrcmp: both arguments must be directories (or both files); \
              remote targets are not supported"
         );
         return 2;
@@ -75,7 +75,7 @@ fn run() -> i32 {
 
     let (cfg, warning) = config::load();
     if let Some(w) = warning {
-        eprintln!("dircmp: warning: {w}");
+        eprintln!("dirrcmp: warning: {w}");
     }
     let ignore_all = cli::build_ignore_full(&c);
     // Patterns saved for this pair of directories (TUI `i` / `I`) apply everywhere.
@@ -97,7 +97,7 @@ fn run() -> i32 {
     match c.cmd {
         Command::Tui => {
             if !std::io::stdout().is_terminal() {
-                eprintln!("dircmp: stdout is not a terminal; use 'dircmp diff' or 'dircmp check'");
+                eprintln!("dirrcmp: stdout is not a terminal; use 'dirrcmp diff' or 'dirrcmp check'");
                 return 2;
             }
             let keys_file = config::keybindings_path();
@@ -122,7 +122,7 @@ fn run() -> i32 {
             match tui::run(tui_cfg) {
                 Ok(()) => 0,
                 Err(e) => {
-                    eprintln!("dircmp: {e}");
+                    eprintln!("dirrcmp: {e}");
                     1
                 }
             }

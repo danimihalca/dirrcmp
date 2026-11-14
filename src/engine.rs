@@ -1503,7 +1503,7 @@ mod tests {
 
     fn tmp() -> PathBuf {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let p = std::env::temp_dir().join(format!("dircmp-test-{}-{}", std::process::id(), n));
+        let p = std::env::temp_dir().join(format!("dirrcmp-test-{}-{}", std::process::id(), n));
         let _ = fs::remove_dir_all(&p);
         fs::create_dir_all(&p).unwrap();
         p
@@ -1818,7 +1818,7 @@ mod merge_tests {
 
     fn tmp() -> PathBuf {
         let p = std::env::temp_dir()
-            .join(format!("dircmp-merge-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
+            .join(format!("dirrcmp-merge-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
         let _ = fs::remove_dir_all(&p);
         fs::create_dir_all(&p).unwrap();
         p
@@ -2104,7 +2104,7 @@ mod pair_tests {
 
     fn tmp() -> PathBuf {
         let p = std::env::temp_dir()
-            .join(format!("dircmp-pair-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
+            .join(format!("dirrcmp-pair-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
         let _ = fs::remove_dir_all(&p);
         fs::create_dir_all(&p).unwrap();
         p
@@ -2246,7 +2246,7 @@ mod file_pair_tests {
     #[test]
     fn renamed_files_can_be_paired() {
         let root = std::env::temp_dir()
-            .join(format!("dircmp-filepair-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
+            .join(format!("dirrcmp-filepair-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
         let _ = fs::remove_dir_all(&root);
         let (l, r) = (root.join("l"), root.join("r"));
         write(&l.join("notes.txt"), "same\n");

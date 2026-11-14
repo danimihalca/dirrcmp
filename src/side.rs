@@ -884,7 +884,7 @@ mod tests {
 
     fn tmp() -> PathBuf {
         let p = std::env::temp_dir()
-            .join(format!("dircmp-side-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
+            .join(format!("dirrcmp-side-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
         let _ = fs::remove_dir_all(&p);
         fs::create_dir_all(&p).unwrap();
         p

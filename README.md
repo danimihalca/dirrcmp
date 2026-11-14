@@ -1,4 +1,4 @@
-# dircmp (Rust)
+# dirrcmp (Rust)
 
 A terminal UI for comparing two directories side by side, with a side-by-side
 file editor. A Rust rewrite of [ilyasturki/dircmp](https://github.com/ilyasturki/dircmp).
@@ -8,25 +8,25 @@ Single binary, Linux / macOS / Windows, no VCS needed.
 
     cargo build --release        # Rust 1.75+; the only dependency is ratatui 0.29
     cargo test                   # engine, CLI, config, undo, side-by-side and TUI logic
-    ./target/release/dircmp LEFT RIGHT
+    ./target/release/dirrcmp LEFT RIGHT
 
 ## Usage
 
-    dircmp LEFT RIGHT                  interactive TUI (two directories)
-    dircmp FILE1 FILE2                 side-by-side editor (unified diff when not a terminal)
-    dircmp diff  LEFT RIGHT            print differences (--format tree|flat|json, --filter, --stat)
-    dircmp check LEFT RIGHT            silent, exit 0 if identical / 1 if different (CI)
+    dirrcmp LEFT RIGHT                  interactive TUI (two directories)
+    dirrcmp FILE1 FILE2                 side-by-side editor (unified diff when not a terminal)
+    dirrcmp diff  LEFT RIGHT            print differences (--format tree|flat|json, --filter, --stat)
+    dirrcmp check LEFT RIGHT            silent, exit 0 if identical / 1 if different (CI)
 
     --no-ignore  --ignore PATTERN (repeatable)  --follow-symlinks  --dates  --quick  --no-syntax
     --diff-cmd "nvim -d"   (or env DIRCMP_DIFF)  external diff for Enter in the TUI
 
 Ignored by default: `.git`, `node_modules`, `.DS_Store`. More patterns come from
-`$XDG_DATA_HOME/dircmp/ignore` (default `~/.local/share/dircmp/ignore`) and, per pair of
+`$XDG_DATA_HOME/dirrcmp/ignore` (default `~/.local/share/dirrcmp/ignore`) and, per pair of
 directories, from `pairs/<id>.ignore` next to it (written by `i` / `I` in the TUI; also
 applied by `diff` and `check`). Syntax is gitignore-like: `*`, `?`, `**`, a leading or inner
 `/` anchors to the root, a trailing `/` matches directories only, `!` negates.
 
-Preferences: `$XDG_CONFIG_HOME/dircmp/config.json` (default `~/.config/dircmp/config.json`) with
+Preferences: `$XDG_CONFIG_HOME/dirrcmp/config.json` (default `~/.config/dirrcmp/config.json`) with
 `compareDates`, `compareContents`, `dirsFirst`, `showHints`, `nerdFont`, `syntaxHighlight`, `chunkBackground`, `diffCommand`. Press `,` in
 the app to change them live; each change is saved. Key bindings: `keybindings.json` next to it
 (see below), or press `K`.
@@ -86,7 +86,7 @@ Action names are listed in the editor's order (`move_down`, `move_up`, `expand`,
   that shadows another action's default) are shown on start; valid entries still apply.
 - Only the directory view is configurable. The side-by-side editor keys are fixed.
 
-## Side-by-side editor (`Enter` on a file, or `dircmp FILE1 FILE2`)
+## Side-by-side editor (`Enter` on a file, or `dirrcmp FILE1 FILE2`)
 
 Aligned panes with intra-line highlighting; changes are yellow, lines only on one side green,
 gaps red. Unchanged stretches can be folded.

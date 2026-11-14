@@ -1098,7 +1098,7 @@ impl App {
         match &self.pair_file {
             Some(p) => {
                 let header = format!(
-                    "dircmp ignore patterns for {} <-> {}",
+                    "dirrcmp ignore patterns for {} <-> {}",
                     self.left.display(),
                     self.right.display()
                 );
@@ -2128,7 +2128,7 @@ mod tests {
 
     fn tmp() -> PathBuf {
         let p = std::env::temp_dir()
-            .join(format!("dircmp-tui-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
+            .join(format!("dirrcmp-tui-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
         let _ = fs::remove_dir_all(&p);
         fs::create_dir_all(&p).unwrap();
         p
@@ -2704,7 +2704,7 @@ mod tests {
         assert!(app.msg.contains("saved for this pair"), "{}", app.msg);
         assert!(!names(&app).contains(&"new.txt".to_string()));
         let text = fs::read_to_string(&file).unwrap();
-        assert!(text.starts_with("# dircmp ignore patterns for "), "{text}");
+        assert!(text.starts_with("# dirrcmp ignore patterns for "), "{text}");
         assert_eq!(cli::read_pair_ignore(&file), vec!["/new.txt".to_string()]);
 
         // a fresh start loads them

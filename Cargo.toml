@@ -1,5 +1,5 @@
 [package]
-name = "dircmp"
+name = "dirrcmp"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
@@ -9,7 +9,9 @@ license = "MIT"
 [dependencies]
 ratatui = "0.29"
 # Optional: far more languages for syntax highlighting (pure Rust regex engine).
-syntect = { version = "5", optional = true, default-features = false, features = ["default-fancy"] }
+syntect = { version = "5", optional = true, default-features = false, features = [
+	"default-fancy",
+] }
 
 [features]
 default = []
