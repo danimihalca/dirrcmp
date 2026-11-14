@@ -699,7 +699,16 @@ impl App {
 
     // ── key handling ──
 
-    fn on_key(&mut self, key: KeyEvent, term: &mut dyn Host) -> io::Result<bool> {
+    fn on_key(&mut self, mut key: KeyEvent, term: &mut dyn Host) -> io::Result<bool> {
+        // Some terminals (kitty protocol, Windows) report Shift+r as 'r' + SHIFT, not 'R'.
+        if let KeyCode::Char(c) = key.code {
+            if key.modifiers.contains(KeyModifiers::SHIFT)
+                && !key.modifiers.contains(KeyModifiers::CONTROL)
+                && c.is_ascii_lowercase()
+            {
+                key.code = KeyCode::Char(c.to_ascii_uppercase());
+            }
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         // Ctrl-C must not throw away unsaved edits in the side-by-side view.
         let editing = matches!(self.mode, Mode::Side(_))
@@ -826,6 +835,14 @@ impl App {
                 ('g', KeyCode::Char('g')) => self.cursor = 0,
                 ('z', KeyCode::Char('R')) => self.expand_all(true),
                 ('z', KeyCode::Char('M')) => self.expand_all(false),
+                ('z', KeyCode::Char('O')) => self.fold_here(true, true),
+                ('z', KeyCode::Char('C')) => self.fold_here(false, true),
+                ('z', KeyCode::Char('o')) => self.fold_here(true, false),
+                ('z', KeyCode::Char('c')) => self.fold_here(false, false),
+                ('z', KeyCode::Char('a')) => {
+                    let open = self.dir_here().map_or(true, |d| !self.expanded.contains(&d));
+                    self.fold_here(open, false)
+                }
                 ('z', KeyCode::Char('i')) => self.toggle_ignore(),
                 (']', KeyCode::Char('c')) => self.jump_diff(true),
                 ('[', KeyCode::Char('c')) => self.jump_diff(false),
@@ -1260,6 +1277,40 @@ impl App {
             let mut s = HashSet::new();
             collect_dirs(&self.tree, false, &mut s);
             self.expanded = s;
+        }
+        self.rebuild_rows();
+    }
+
+    /// The directory under the cursor, or the parent directory of the file under it.
+    fn dir_here(&self) -> Option<PathBuf> {
+        let r = self.rows.get(self.cursor)?;
+        if r.is_dir {
+            Some(r.rel.clone())
+        } else {
+            r.rel.parent().filter(|p| !p.as_os_str().is_empty()).map(|p| p.to_path_buf())
+        }
+    }
+
+    /// `zo`/`zc` (and `zO`/`zC` with `deep`): open or close the directory under the cursor.
+    fn fold_here(&mut self, open: bool, deep: bool) {
+        let Some(dir) = self.dir_here() else { return };
+        if open {
+            self.expanded.insert(dir.clone());
+            if deep {
+                let mut all = HashSet::new();
+                collect_dirs(&self.tree, false, &mut all);
+                self.expanded.extend(all.into_iter().filter(|d| d.starts_with(&dir)));
+            }
+        } else if deep {
+            self.expanded.retain(|d| !d.starts_with(&dir));
+        } else {
+            self.expanded.remove(&dir);
+        }
+        // closing hides the children, so the cursor goes to the directory itself
+        if !open {
+            if let Some(i) = self.rows.iter().position(|r| r.rel == dir) {
+                self.cursor = i;
+            }
         }
         self.rebuild_rows();
     }
@@ -2170,7 +2221,7 @@ const HELP: &str = "\
   j k / arrows    move               l / Right   expand dir, or open file
   gg  G           first / last       h / Left    collapse dir, or go to parent
   ^d ^u ^f ^b     half / full page   Enter       side-by-side editor (dirs: toggle)
-  ^e ^y           scroll view        zR  zM      expand / collapse all
+  ^e ^y           scroll view        zR  zM      expand / collapse all (zO zC: here)
   Tab %  H  L     switch panel       ]c  [c      next / previous difference
 
  Actions                            Filtering and ignoring
@@ -2290,7 +2341,7 @@ fn draw_keys(f: &mut Frame, area: Rect, ui: &KeysUi, km: &Keymap) {
 
 fn status_style(status: Status, present: bool) -> Style {
     match (present, status) {
-        (false, _) => Style::default().fg(Color::Red).add_modifier(Modifier::DIM),
+        (false, _) => Style::default().fg(Color::Red),
         (true, Status::Same) => Style::default().add_modifier(Modifier::DIM),
         (true, Status::Modified) => Style::default().fg(Color::Yellow),
         (true, _) => Style::default().fg(Color::Green),
@@ -2513,13 +2564,18 @@ fn side_line(
     let rest = format!("{:<nw$} {:>rw$}", name, size_txt, nw = name_w, rw = right_w);
 
     let mut style = match (meta.is_some(), row.status) {
-        (false, _) => Style::default().fg(Color::Red).add_modifier(Modifier::DIM),
+        (false, _) => Style::default().fg(Color::Red),
         (true, Status::Same) => Style::default().add_modifier(Modifier::DIM),
         (true, Status::Modified) => Style::default().fg(Color::Yellow),
         (true, _) => Style::default().fg(Color::Green),
     };
     if selected {
-        style = style.add_modifier(Modifier::REVERSED);
+        style = if meta.is_none() {
+            // reversed red would be dark text on red; black on red stays readable
+            Style::default().fg(Color::Black).bg(Color::Red)
+        } else {
+            style.add_modifier(Modifier::REVERSED)
+        };
     }
     if marked {
         let mut mark_style = Style::default().fg(Color::Magenta);
@@ -2862,6 +2918,42 @@ mod tests {
         put(l.join("node_modules/z"), "ignored");
         let app = build(&root, None);
         (root, app)
+    }
+
+    #[test]
+    fn folding_here_and_shift_keys() {
+        let root = tmp();
+        let (l, r) = (root.join("l"), root.join("r"));
+        put(l.join("a/b/x.txt"), "1\n");
+        put(r.join("a/b/x.txt"), "2\n");
+        put(l.join("a/y.txt"), "1\n");
+        put(r.join("a/y.txt"), "2\n");
+        let mut app = build(&root, None);
+        assert_eq!(names(&app), vec!["a", "b", "x.txt", "y.txt"]);
+        select(&mut app, "x.txt");
+        keys(&mut app, "zc"); // closes the parent of a file: b
+        assert_eq!(names(&app), vec!["a", "b", "y.txt"]);
+        assert_eq!(app.rows[app.cursor].name, "b");
+        keys(&mut app, "zo");
+        assert_eq!(app.rows.len(), 4);
+        select(&mut app, "x.txt");
+        keys(&mut app, "zC"); // recursive close of b
+        assert_eq!(names(&app), vec!["a", "b", "y.txt"]);
+        select(&mut app, "a");
+        keys(&mut app, "zC");
+        assert_eq!(names(&app), vec!["a"]);
+        keys(&mut app, "zO"); // recursive open
+        assert_eq!(names(&app), vec!["a", "b", "x.txt", "y.txt"]);
+        keys(&mut app, "za");
+        assert_eq!(names(&app), vec!["a"]);
+        // Shift+r reported as 'r' + SHIFT still means R
+        keys(&mut app, "z");
+        app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::SHIFT), &mut Rec::default()).unwrap();
+        assert_eq!(app.rows.len(), 4);
+        keys(&mut app, "z");
+        app.on_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::SHIFT), &mut Rec::default()).unwrap();
+        assert_eq!(names(&app), vec!["a"]);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

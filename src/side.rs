@@ -820,7 +820,7 @@ impl SideView {
             (RowKind::Equal, _) => {}
             (RowKind::Changed, _) => base = base.fg(Color::Yellow),
             (_, true) => base = base.fg(Color::Green),
-            (_, false) => base = base.fg(Color::Red).add_modifier(Modifier::DIM),
+            (_, false) => base = base.fg(Color::Red),
         }
 
         // Row tint: a brighter shade for the hunk the cursor is in.

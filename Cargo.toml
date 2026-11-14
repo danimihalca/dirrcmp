@@ -9,9 +9,7 @@ license = "MIT"
 [dependencies]
 ratatui = "0.29"
 # Optional: far more languages for syntax highlighting (pure Rust regex engine).
-syntect = { version = "5", optional = true, default-features = false, features = [
-	"default-fancy",
-] }
+syntect = { version = "5", optional = true, default-features = false, features = ["default-fancy"] }
 
 [features]
 default = []
