@@ -19,6 +19,10 @@ USAGE:
 
 OPTIONS:
         --no-ignore           disable all ignore patterns
+        --git [REV [REV2]]    compare a git revision (default HEAD) with the working tree,
+                              or two revisions; replaces LEFT RIGHT
+        --staged              with --git: compare against the index instead of the working tree
+        --repo <DIR>          with --git: repository to use (default: current directory)
         --no-syntax           no syntax highlighting in the diff views
         --ignore <PATTERN>    add a gitignore-style pattern (repeatable)
         --follow-symlinks     follow symlinks instead of comparing link targets
@@ -40,7 +44,7 @@ saved per pair of directories in the pairs/ folder next to it and also apply
 to 'diff' and 'check'.
 Preferences live in $XDG_CONFIG_HOME/dirrcmp/config.json (default
 ~/.config/dirrcmp/config.json): compareDates, compareContents, dirsFirst,
-showHints, nerdFont, syntaxHighlight, chunkBackground, diffCommand.
+showHints, nerdFont, syntaxHighlight, chunkBackground, smoothScroll, diffCommand.
 ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +75,8 @@ pub struct Cli {
     pub compare_dates: bool,
     pub quick: bool,
     pub diff_cmd: Option<String>,
+    /// `--git`: compare a revision with the working tree instead of two paths.
+    pub git: Option<crate::git::GitOpts>,
 }
 
 fn take_value(
@@ -112,6 +118,9 @@ pub fn parse_args(args: Vec<String>) -> Result<Cli, String> {
     let mut quick = false;
     let mut diff_cmd = env::var("DIRCMP_DIFF").ok().filter(|s| !s.trim().is_empty());
     let mut only_positional = false;
+    let mut git = false;
+    let mut staged = false;
+    let mut repo: Option<String> = None;
 
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
@@ -133,6 +142,9 @@ pub fn parse_args(args: Vec<String>) -> Result<Cli, String> {
             "-v" | "--version" => version = true,
             "--no-ignore" => no_ignore = true,
             "--no-syntax" => no_syntax = true,
+            "--git" => git = true,
+            "--staged" | "--cached" => staged = true,
+            "--repo" => repo = Some(take_value("--repo", inline, &mut it)?),
             "--follow-symlinks" => follow_symlinks = true,
             "--dates" => compare_dates = true,
             "--quick" => quick = true,
@@ -167,8 +179,30 @@ pub fn parse_args(args: Vec<String>) -> Result<Cli, String> {
         }
     };
 
+    let git = if git && matches!(cmd, Command::Tui | Command::Diff { .. } | Command::Check { .. }) {
+        if pos.len() > 2 {
+            return Err(format!("--git takes at most two revisions, got {}", pos.len()));
+        }
+        Some(crate::git::GitOpts {
+            revs: pos.clone(),
+            staged,
+            repo: PathBuf::from(repo.clone().unwrap_or_else(|| ".".to_string())),
+        })
+    } else {
+        if !matches!(cmd, Command::Help | Command::Version) {
+            if staged {
+                return Err("--staged only works with --git".to_string());
+            }
+            if repo.is_some() {
+                return Err("--repo only works with --git".to_string());
+            }
+        }
+        None
+    };
+
     let (left, right) = match cmd {
         Command::Help | Command::Version => (None, None),
+        _ if git.is_some() => (None, None),
         _ => {
             if pos.len() != 2 {
                 return Err(format!("expected exactly two paths (LEFT RIGHT), got {}", pos.len()));
@@ -177,7 +211,7 @@ pub fn parse_args(args: Vec<String>) -> Result<Cli, String> {
         }
     };
 
-    Ok(Cli { cmd, left, right, no_ignore, no_syntax, ignore, follow_symlinks, compare_dates, quick, diff_cmd })
+    Ok(Cli { cmd, left, right, no_ignore, no_syntax, ignore, follow_symlinks, compare_dates, quick, diff_cmd, git })
 }
 
 // ───────────────────────────── ignore loading ─────────────────────────────
@@ -457,6 +491,7 @@ mod tests {
         assert!(matches!(c.cmd, Command::Check { stat: false }));
         assert!(c.no_ignore && c.compare_dates && c.quick && !c.no_syntax);
         assert!(parse_args(args("--no-syntax a b")).unwrap().no_syntax);
+        assert!(c.git.is_none());
 
         let c = parse_args(args("--follow-symlinks --diff-cmd=nvim a b")).unwrap();
         assert!(matches!(c.cmd, Command::Tui));
@@ -554,5 +589,32 @@ mod tests {
         assert!(!f.exists());
         write_pair_ignore(&f, &[], "h").unwrap();
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn git_mode_takes_revisions_instead_of_paths() {
+        let g = |a: &str| parse_args(args(a));
+        let c = g("--git").unwrap();
+        let o = c.git.unwrap();
+        assert!(o.revs.is_empty() && !o.staged && o.repo == PathBuf::from("."));
+        assert!(c.left.is_none() && c.right.is_none());
+        assert!(matches!(c.cmd, Command::Tui));
+        let o = g("--git HEAD~2 --staged").unwrap().git.unwrap();
+        assert_eq!(o.revs, ["HEAD~2"]);
+        assert!(o.staged);
+        let o = g("--git v1 v2 --repo /tmp/x").unwrap().git.unwrap();
+        assert_eq!(o.revs, ["v1", "v2"]);
+        assert_eq!(o.repo, PathBuf::from("/tmp/x"));
+        assert!(g("--git --cached").unwrap().git.unwrap().staged);
+        // subcommands work with it, in either order
+        let c = g("diff --git main --stat").unwrap();
+        assert!(matches!(c.cmd, Command::Diff { stat: true, .. }) && c.git.unwrap().revs == ["main"]);
+        assert!(matches!(g("check --git").unwrap().cmd, Command::Check { .. }));
+        // errors
+        assert!(g("--git a b c").unwrap_err().contains("at most two"));
+        assert!(g("--staged a b").unwrap_err().contains("--git"));
+        assert!(g("--repo x a b").unwrap_err().contains("--git"));
+        assert!(g("a b").unwrap().git.is_none());
+        assert!(g("--git --help").is_ok());
     }
 }

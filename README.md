@@ -10,9 +10,21 @@ Single binary, Linux / macOS / Windows, no VCS needed.
     cargo test                   # engine, CLI, config, undo, side-by-side and TUI logic
     ./target/release/dirrcmp LEFT RIGHT
 
+## Nix
+
+    cargo generate-lockfile && git add Cargo.lock flake.nix   # once; flakes only see tracked files
+    nix build                  # ./result/bin/dirrcmp
+    nix run . -- LEFT RIGHT
+    nix build .#dirrcmp-syntect # with the optional syntect highlighter
+    nix develop                # shell with cargo, rustc, clippy, rust-analyzer
+
+Add `inputs.dirrcmp.url = "github:you/dirrcmp"` and the overlay `dirrcmp.overlays.default` to
+use it in a NixOS or home-manager config (`pkgs.dirrcmp`).
+
 ## Usage
 
     dirrcmp LEFT RIGHT                  interactive TUI (two directories)
+    dirrcmp --git [REV [REV2]] [--staged]   git revision vs working tree (or vs another revision)
     dirrcmp FILE1 FILE2                 side-by-side editor (unified diff when not a terminal)
     dirrcmp diff  LEFT RIGHT            print differences (--format tree|flat|json, --filter, --stat)
     dirrcmp check LEFT RIGHT            silent, exit 0 if identical / 1 if different (CI)
@@ -107,6 +119,32 @@ gaps red. Unchanged stretches can be folded.
 
 Line endings (LF/CRLF) and a missing final newline are preserved when saving. Binary,
 non-UTF-8 and files over 8 MiB fall back to a read-only note.
+
+## Git mode
+
+    dirrcmp --git                  HEAD  vs  working tree
+    dirrcmp --git v1.2             v1.2  vs  working tree
+    dirrcmp --git main feature     two revisions
+    dirrcmp --git --staged         HEAD  vs  index (what the next commit contains)
+    dirrcmp diff --git HEAD~3 --stat      (also works with `diff` and `check`; `--repo DIR` picks the repo)
+
+The left revision is exported to a temporary directory with `git cat-file` (removed on exit), so
+everything above works unchanged: tree, side-by-side editor, syntax highlighting, filters.
+`.gitignore`d files and submodule directories are left out of the working-tree side. Snapshot
+sides are **read-only**: copy / delete / edit there is refused. The useful direction is
+copying from the snapshot into the working tree, which reverts a file (`>` in the list) or a
+single hunk / line (`>` / `.` in the side-by-side editor). Only the `git` command is used, no
+library. Untracked files show up as right-only. Submodule contents and LFS data are not
+compared (LFS files compare as their pointer files).
+
+## Smooth scrolling
+
+`^d` `^u` `^f` `^b` and `PageUp` / `PageDown` glide over about a tenth to a third of a second with
+a sine ease-out (fast start, gentle stop), like neoscroll.nvim's default. The cursor moves with
+the view. More page keys in the same direction extend the glide, the opposite direction cancels
+what was left, and any other key finishes it first. Applies to the directory list, the unified
+view and the side-by-side editor. `j` / `k` / arrows and the mouse wheel (which terminals send
+as arrow keys) are not animated. Turn off with `,` → *Smooth scrolling* (`smoothScroll`).
 
 ## Chunk background
 

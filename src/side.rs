@@ -12,6 +12,8 @@ use ratatui::Frame;
 
 use crate::engine::{self, FileDiff, Merge, Pane, RowKind};
 use crate::highlight::{self, Kind};
+use crate::smooth::Scroller;
+use std::time::Instant;
 
 pub enum Outcome {
     Stay,
@@ -65,6 +67,10 @@ pub struct SideView {
     syntax: bool,
     /// Tint the whole row of every changed chunk.
     chunk_bg: bool,
+    smooth: bool,
+    /// (left, right) must not be changed (git snapshots).
+    readonly: (bool, bool),
+    scroller: Scroller,
     syn: Option<Syn>,
 }
 
@@ -73,6 +79,13 @@ struct Syn {
     rev: u64,
     left: Option<(String, Vec<Vec<Kind>>)>,
     right: Option<(String, Vec<Vec<Kind>>)>,
+}
+
+/// Keys whose movement is eased when smooth scrolling is on.
+pub fn is_smooth_key(k: &KeyEvent) -> bool {
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    matches!(k.code, KeyCode::Char('d' | 'u' | 'f' | 'b')) && ctrl
+        || matches!(k.code, KeyCode::PageDown | KeyCode::PageUp)
 }
 
 /// Background of a changed row: yellowish = modified, green = only here, red = missing here.
@@ -139,6 +152,9 @@ impl SideView {
             saved_any: false,
             syntax: true,
             chunk_bg: true,
+            smooth: true,
+            readonly: (false, false),
+            scroller: Scroller::default(),
             syn: None,
         };
         v.rebuild();
@@ -148,6 +164,60 @@ impl SideView {
         }
         v.fix_cursor();
         v
+    }
+
+    #[cfg(test)]
+    pub fn readonly(&self) -> (bool, bool) {
+        self.readonly
+    }
+
+    pub fn set_readonly(&mut self, left: bool, right: bool) {
+        self.readonly = (left, right);
+    }
+
+    /// True (and a message) when `pane` is a read-only snapshot.
+    fn deny(&mut self, pane: Pane) -> bool {
+        let ro = if pane == Pane::Left { self.readonly.0 } else { self.readonly.1 };
+        if ro {
+            self.msg = format!("the {} side is a read-only git snapshot", pane.name());
+        }
+        ro
+    }
+
+    pub fn set_smooth(&mut self, on: bool) {
+        self.smooth = on;
+        if !on {
+            self.flush_scroll();
+        }
+    }
+
+    pub fn scroll_active(&self) -> bool {
+        self.scroller.active()
+    }
+
+    /// Advance a running scroll animation by the time that has passed.
+    pub fn tick_scroll(&mut self) {
+        let d = self.scroller.tick(Instant::now());
+        if d != 0 {
+            self.mv(d);
+        }
+    }
+
+    /// Finish a running scroll animation at once.
+    fn flush_scroll(&mut self) {
+        let d = self.scroller.flush();
+        if d != 0 {
+            self.mv(d);
+        }
+    }
+
+    /// Scroll by `n` lines, eased when smooth scrolling is on.
+    fn scroll_lines(&mut self, n: isize) {
+        if self.smooth {
+            self.scroller.push(n, Instant::now());
+        } else {
+            self.mv(n);
+        }
     }
 
     pub fn set_chunk_bg(&mut self, on: bool) {
@@ -296,6 +366,9 @@ impl SideView {
     pub fn on_key(&mut self, key: KeyEvent) -> Outcome {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         self.msg.clear();
+        if !(is_smooth_key(&key) && matches!(self.mode, Mode::Normal)) {
+            self.flush_scroll();
+        }
         match std::mem::replace(&mut self.mode, Mode::Normal) {
             Mode::Normal => self.normal_key(key, ctrl),
             Mode::Help => Outcome::Stay,
@@ -333,10 +406,10 @@ impl SideView {
 
         let h = self.view_h.max(1) as isize;
         match key.code {
-            KeyCode::Char('d') if ctrl => self.mv(h / 2),
-            KeyCode::Char('u') if ctrl => self.mv(-(h / 2)),
-            KeyCode::Char('f') if ctrl => self.mv(h),
-            KeyCode::Char('b') if ctrl => self.mv(-h),
+            KeyCode::Char('d') if ctrl => self.scroll_lines(h / 2),
+            KeyCode::Char('u') if ctrl => self.scroll_lines(-(h / 2)),
+            KeyCode::Char('f') if ctrl => self.scroll_lines(h),
+            KeyCode::Char('b') if ctrl => self.scroll_lines(-h),
             KeyCode::Char('r') if ctrl => {
                 if self.m.redo() {
                     self.after_edit();
@@ -358,8 +431,8 @@ impl SideView {
             }
             KeyCode::Char('j') | KeyCode::Down => self.mv(1),
             KeyCode::Char('k') | KeyCode::Up => self.mv(-1),
-            KeyCode::PageDown => self.mv(h),
-            KeyCode::PageUp => self.mv(-h),
+            KeyCode::PageDown => self.scroll_lines(h),
+            KeyCode::PageUp => self.scroll_lines(-h),
             KeyCode::Home => self.goto_pos(0),
             KeyCode::End | KeyCode::Char('G') => self.goto_pos(usize::MAX),
             KeyCode::Char(c @ ('g' | ']' | '[' | 'd')) => self.pending = Some(c),
@@ -470,6 +543,9 @@ impl SideView {
 
     fn start_edit(&mut self, new_line: bool) {
         let pane = self.active;
+        if self.deny(pane) {
+            return;
+        }
         let row = self.m.align.rows.get(self.cursor).cloned();
         if row.is_none() && !new_line {
             return;
@@ -503,6 +579,9 @@ impl SideView {
     }
 
     fn put_hunk(&mut self, from: Pane) {
+        if self.deny(from.other()) {
+            return;
+        }
         let Some(h) = self.m.hunk_at(self.cursor) else {
             self.msg = "not on a change".to_string();
             return;
@@ -516,6 +595,9 @@ impl SideView {
     }
 
     fn put_line(&mut self, from: Pane) {
+        if self.deny(from.other()) {
+            return;
+        }
         let on_change = self
             .m
             .align
@@ -535,6 +617,9 @@ impl SideView {
     }
 
     fn delete_line(&mut self) {
+        if self.deny(self.active) {
+            return;
+        }
         if self.m.delete_line(self.cursor, self.active) {
             self.after_edit();
             self.msg = format!("deleted line on the {} side", self.active.name());
@@ -1013,6 +1098,66 @@ mod tests {
         assert_eq!((kw.style.fg, kw.style.bg), (Some(Color::Magenta), Some(Color::Indexed(58))));
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&root2);
+    }
+
+    #[test]
+    fn page_keys_ease_in_the_side_view() {
+        let a: String = (0..80).map(|i| format!("a{i}\n")).collect();
+        let b: String = (0..80).map(|i| format!("b{i}\n")).collect();
+        let (root, mut v) = view(&a, &b);
+        v.view_h = 20;
+        let ctrl_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+        let start = v.cursor;
+        v.on_key(ctrl_d);
+        assert_eq!(v.cursor, start, "the key only starts the animation");
+        assert!(v.scroll_active());
+        v.on_key(ctrl_d);
+        assert_eq!(v.scroller.remaining(), 20);
+        // another key finishes it, then acts
+        typed(&mut v, "j");
+        assert!(!v.scroll_active());
+        assert_eq!(v.cursor, start + 21);
+        // time alone completes it too
+        k(&mut v, KeyCode::PageDown);
+        assert!(v.scroll_active());
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        v.tick_scroll();
+        assert!(!v.scroll_active());
+        assert_eq!(v.cursor, start + 41);
+        // switched off: immediate
+        v.set_smooth(false);
+        v.on_key(ctrl_d);
+        assert_eq!(v.cursor, start + 51);
+        assert!(!v.scroll_active());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_only_panes_refuse_edits_but_can_be_copied_from() {
+        let (root, mut v) = view("a\nold\nc\n", "a\nnew\nc\n");
+        v.set_readonly(true, false);
+        let text_l = v.m.left.lines.clone();
+        // the active pane starts on the right: editing works there
+        typed(&mut v, "H");
+        assert_eq!(v.active, Pane::Left);
+        v.cursor = v.m.align.rows.iter().position(|r| r.kind != RowKind::Equal).unwrap();
+        typed(&mut v, "e");
+        assert!(matches!(v.mode, Mode::Normal), "no edit prompt on the snapshot");
+        assert!(v.msg.contains("read-only"), "{}", v.msg);
+        typed(&mut v, "o");
+        assert!(matches!(v.mode, Mode::Normal));
+        typed(&mut v, "dd");
+        assert_eq!(v.m.left.lines, text_l);
+        // copying into the snapshot (<) is refused, copying out of it (>) works
+        typed(&mut v, "<");
+        assert!(v.msg.contains("left side is a read-only"), "{}", v.msg);
+        assert_eq!(v.m.left.lines, text_l);
+        typed(&mut v, ",");
+        assert!(v.msg.contains("read-only"));
+        assert_eq!(v.m.left.lines, text_l);
+        typed(&mut v, ">");
+        assert_eq!(v.m.right.lines, text_l, "reverted the working tree side");
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

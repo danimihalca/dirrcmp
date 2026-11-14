@@ -1,9 +1,11 @@
 mod cli;
 mod config;
 mod engine;
+mod git;
 mod highlight;
 mod keys;
 mod side;
+mod smooth;
 #[cfg(feature = "syntect")]
 mod syn_syntect;
 mod undo;
@@ -39,17 +41,31 @@ fn run() -> i32 {
         }
         _ => {}
     }
-    let (left, right) = match (&c.left, &c.right) {
-        (Some(l), Some(r)) => (l.clone(), r.clone()),
+    // `--git`: the two sides are temporary exports of revisions (and the working tree).
+    // The session removes the exports when it is dropped at the end of `run`.
+    let session = match &c.git {
+        Some(g) => match git::prepare(g) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!("dirrcmp: git: {e}");
+                return 2;
+            }
+        },
+        None => None,
+    };
+    let (left, right) = match (&session, &c.left, &c.right) {
+        (Some(s), _, _) => (s.left.clone(), s.right.clone()),
+        (None, Some(l), Some(r)) => (l.clone(), r.clone()),
         _ => return 2, // parse_args guarantees both paths for these commands
     };
 
     // Two files: side-by-side editor on a terminal, otherwise a plain unified
     // diff like `diff -u` (exit 1 if different).
-    if left.is_file() && right.is_file() {
+    if session.is_none() && left.is_file() && right.is_file() {
         if matches!(c.cmd, Command::Tui) && std::io::stdout().is_terminal() {
-            let syntax = config::load().0.syntax && !c.no_syntax;
-            match tui::run_files(left.clone(), right.clone(), syntax) {
+            let prefs = config::load().0;
+            let syntax = prefs.syntax && !c.no_syntax;
+            match tui::run_files(left.clone(), right.clone(), syntax, prefs.smooth) {
                 Ok(None) => return 0,
                 Ok(Some(fd)) => {
                     print!("{}", cli::render_file_diff(&fd, &left, &right));
@@ -77,9 +93,14 @@ fn run() -> i32 {
     if let Some(w) = warning {
         eprintln!("dirrcmp: warning: {w}");
     }
-    let ignore_all = cli::build_ignore_full(&c);
+    let mut ignore_all = cli::build_ignore_full(&c);
+    if let Some(s) = &session {
+        for p in &s.ignores {
+            ignore_all.add(p);
+        }
+    }
     // Patterns saved for this pair of directories (TUI `i` / `I`) apply everywhere.
-    let pair_file = cli::pair_ignore_path(&left, &right);
+    let pair_file = if session.is_some() { None } else { cli::pair_ignore_path(&left, &right) };
     let mut effective = ignore_all.clone();
     if let Some(pf) = &pair_file {
         for l in cli::read_pair_ignore(pf) {
@@ -113,6 +134,8 @@ fn run() -> i32 {
                 cli_quick: c.quick,
                 cli_diff: c.diff_cmd,
                 cli_no_syntax: c.no_syntax,
+                readonly: session.as_ref().map_or((false, false), |s| s.readonly),
+                labels: session.as_ref().map(|s| s.labels.clone()),
                 keymap,
                 key_warnings,
                 config_file: config::config_path(),

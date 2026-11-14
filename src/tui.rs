@@ -21,6 +21,8 @@ use crate::engine::{
 use crate::keys::{self, Chord, Key, Keymap, Tr};
 use crate::highlight::{self, Kind};
 use crate::side::{self, Outcome, SideView};
+use crate::smooth::{self as smooth_mod, Scroller};
+use std::time::Instant;
 use crate::undo::{Journal, Recipe};
 
 pub struct Config {
@@ -37,6 +39,10 @@ pub struct Config {
     pub cli_diff: Option<String>,
     /// `--no-syntax`: no highlighting for this run, whatever the preferences say.
     pub cli_no_syntax: bool,
+    /// Sides that are read-only snapshots (git mode): (left, right).
+    pub readonly: (bool, bool),
+    /// Panel titles to show instead of the paths (git mode): (left, right).
+    pub labels: Option<(String, String)>,
     pub keymap: Keymap,
     /// Problems found in `keybindings.json`, shown on start.
     pub key_warnings: Vec<String>,
@@ -57,12 +63,13 @@ pub fn run(cfg: Config) -> io::Result<()> {
 
 /// Two plain files: open the side-by-side editor on its own. Returns the
 /// `FileDiff` to print instead when the files can't be edited as text.
-pub fn run_files(left: PathBuf, right: PathBuf, syntax: bool) -> io::Result<Option<FileDiff>> {
+pub fn run_files(left: PathBuf, right: PathBuf, syntax: bool, smooth: bool) -> io::Result<Option<FileDiff>> {
     let mut view = match SideView::open(left, right, true, true) {
         Ok(v) => v,
         Err(fd) => return Ok(Some(fd)),
     };
     view.set_syntax(syntax);
+    view.set_smooth(smooth);
     let mut terminal = ratatui::init();
     let res = file_loop(&mut terminal, &mut view);
     ratatui::restore();
@@ -71,6 +78,7 @@ pub fn run_files(left: PathBuf, right: PathBuf, syntax: bool) -> io::Result<Opti
 
 fn file_loop(term: &mut DefaultTerminal, view: &mut SideView) -> io::Result<()> {
     loop {
+        view.tick_scroll();
         term.draw(|f| {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
@@ -82,6 +90,9 @@ fn file_loop(term: &mut DefaultTerminal, view: &mut SideView) -> io::Result<()> 
                 chunks[1],
             );
         })?;
+        if view.scroll_active() && !event::poll(smooth_mod::FRAME)? {
+            continue;
+        }
         // Handle everything that is already queued before drawing again. Terminals turn a
         // mouse-wheel flick into a burst of Up/Down keys; redrawing after each one makes the
         // view lag behind and keep scrolling after the wheel has stopped or reversed.
@@ -275,6 +286,7 @@ struct DiffView {
     removed: usize,
     syntax: Option<UniSyntax>,
     chunk_bg: bool,
+    scroller: Scroller,
 }
 
 /// Highlighting for both files of a unified diff, indexed by line number.
@@ -309,6 +321,12 @@ impl UniSyntax {
 }
 
 impl DiffView {
+    /// Scroll by `n` lines, staying inside the text.
+    fn shift(&mut self, n: isize) {
+        let max = self.lines.len().saturating_sub(1) as isize;
+        self.scroll = (self.scroll as isize + n).clamp(0, max) as usize;
+    }
+
     fn new(rel: &Path, fd: FileDiff) -> DiffView {
         let title = engine::rel_string(rel);
         let note_title = title.clone();
@@ -321,6 +339,7 @@ impl DiffView {
             removed: 0,
             syntax: None,
             chunk_bg: false,
+            scroller: Scroller::default(),
         };
         match fd {
             FileDiff::Text(d) => {
@@ -334,6 +353,7 @@ impl DiffView {
                     scroll: 0,
                     syntax: None,
                     chunk_bg: false,
+                    scroller: Scroller::default(),
                 }
             }
             FileDiff::Identical => note_only("Files are identical".to_string()),
@@ -367,7 +387,7 @@ struct PrefsUi {
     editing: Option<String>,
 }
 
-const PREF_ROWS: usize = 8;
+const PREF_ROWS: usize = 9;
 
 struct KeysUi {
     sel: usize,
@@ -414,8 +434,12 @@ struct App {
     cli_quick: bool,
     cli_diff: Option<String>,
     cli_no_syntax: bool,
+    readonly: (bool, bool),
+    labels: Option<(String, String)>,
     syntax: bool,
     chunk_bg: bool,
+    smooth: bool,
+    scroller: Scroller,
     keymap: Keymap,
     config_file: Option<PathBuf>,
     keys_file: Option<PathBuf>,
@@ -470,10 +494,14 @@ impl App {
             nerd_font: cfg.prefs.nerd_font,
             syntax: cfg.prefs.syntax && !cfg.cli_no_syntax,
             chunk_bg: cfg.prefs.chunk_bg,
+            smooth: cfg.prefs.smooth,
+            scroller: Scroller::default(),
             prefs: cfg.prefs,
             cli_dates: cfg.cli_dates,
             cli_quick: cfg.cli_quick,
             cli_no_syntax: cfg.cli_no_syntax,
+            readonly: cfg.readonly,
+            labels: cfg.labels,
             cli_diff: cfg.cli_diff,
             keymap: cfg.keymap,
             config_file: cfg.config_file,
@@ -507,7 +535,12 @@ impl App {
 
     fn event_loop(&mut self, term: &mut DefaultTerminal) -> io::Result<()> {
         loop {
+            self.tick_scroll();
             term.draw(|f| self.draw(f))?;
+            // While an animation runs, wake up every frame instead of waiting for a key.
+            if self.scroll_active() && !event::poll(smooth_mod::FRAME)? {
+                continue;
+            }
             // Drain the queue before redrawing (see `file_loop`).
             loop {
                 if let Event::Key(k) = event::read()? {
@@ -566,6 +599,10 @@ impl App {
             return Ok(true);
         }
         self.msg.clear();
+        // Any other key ends a running scroll animation first, so it acts on the final position.
+        if !(side::is_smooth_key(&key) && matches!(self.mode, Mode::Normal | Mode::Diff(_) | Mode::Side(_))) {
+            self.flush_scroll();
+        }
         let mode = std::mem::replace(&mut self.mode, Mode::Normal);
         match mode {
             Mode::Normal => self.normal_dispatch(key, term),
@@ -678,18 +715,18 @@ impl App {
         let half = (self.view_h / 2).max(1) as isize;
         let page = self.view_h.max(1) as isize;
         match key.code {
-            KeyCode::Char('d') if ctrl => self.mv(half),
-            KeyCode::Char('u') if ctrl => self.mv(-half),
-            KeyCode::Char('f') if ctrl => self.mv(page),
-            KeyCode::Char('b') if ctrl => self.mv(-page),
+            KeyCode::Char('d') if ctrl => self.scroll_lines(half),
+            KeyCode::Char('u') if ctrl => self.scroll_lines(-half),
+            KeyCode::Char('f') if ctrl => self.scroll_lines(page),
+            KeyCode::Char('b') if ctrl => self.scroll_lines(-page),
             KeyCode::Char('e') if ctrl => self.scroll_view(1),
             KeyCode::Char('y') if ctrl => self.scroll_view(-1),
             _ if ctrl => {}
             KeyCode::Char('q') => return Ok(true),
             KeyCode::Char('j') | KeyCode::Down => self.mv(1),
             KeyCode::Char('k') | KeyCode::Up => self.mv(-1),
-            KeyCode::PageDown => self.mv(page),
-            KeyCode::PageUp => self.mv(-page),
+            KeyCode::PageDown => self.scroll_lines(page),
+            KeyCode::PageUp => self.scroll_lines(-page),
             KeyCode::Home => self.cursor = 0,
             KeyCode::End | KeyCode::Char('G') => self.cursor = self.rows.len().saturating_sub(1),
             KeyCode::Char(c @ ('g' | 'z' | ']' | '[')) => self.pending = Some(c),
@@ -717,6 +754,10 @@ impl App {
             }
             KeyCode::Char('S') => {
                 std::mem::swap(&mut self.left, &mut self.right);
+                self.readonly = (self.readonly.1, self.readonly.0);
+                if let Some(l) = &mut self.labels {
+                    *l = (l.1.clone(), l.0.clone());
+                }
                 self.refresh();
                 self.msg = "swapped panels".to_string();
             }
@@ -758,18 +799,18 @@ impl App {
         let h = self.view_h.max(1);
         let max = dv.lines.len().saturating_sub(1);
         match key.code {
-            KeyCode::Char('d') if ctrl => dv.scroll = (dv.scroll + h / 2).min(max),
-            KeyCode::Char('u') if ctrl => dv.scroll = dv.scroll.saturating_sub(h / 2),
-            KeyCode::Char('f') if ctrl => dv.scroll = (dv.scroll + h).min(max),
-            KeyCode::Char('b') if ctrl => dv.scroll = dv.scroll.saturating_sub(h),
+            KeyCode::Char('d') if ctrl => self.scroll_diff(dv, (h / 2) as isize),
+            KeyCode::Char('u') if ctrl => self.scroll_diff(dv, -((h / 2) as isize)),
+            KeyCode::Char('f') if ctrl => self.scroll_diff(dv, h as isize),
+            KeyCode::Char('b') if ctrl => self.scroll_diff(dv, -(h as isize)),
             _ if ctrl => {}
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter | KeyCode::Char('h') | KeyCode::Left => {
                 return false
             }
             KeyCode::Char('j') | KeyCode::Down => dv.scroll = (dv.scroll + 1).min(max),
             KeyCode::Char('k') | KeyCode::Up => dv.scroll = dv.scroll.saturating_sub(1),
-            KeyCode::PageDown | KeyCode::Char(' ') => dv.scroll = (dv.scroll + h).min(max),
-            KeyCode::PageUp => dv.scroll = dv.scroll.saturating_sub(h),
+            KeyCode::PageDown | KeyCode::Char(' ') => self.scroll_diff(dv, h as isize),
+            KeyCode::PageUp => self.scroll_diff(dv, -(h as isize)),
             KeyCode::Char('g') | KeyCode::Home => dv.scroll = 0,
             KeyCode::Char('G') | KeyCode::End => dv.scroll = max,
             KeyCode::Char('n') | KeyCode::Char(']') => {
@@ -793,6 +834,64 @@ impl App {
             _ => {}
         }
         true
+    }
+
+    // ── smooth scrolling ──
+
+    fn scroll_lines(&mut self, n: isize) {
+        if self.smooth {
+            self.scroller.push(n, Instant::now());
+        } else {
+            self.mv(n);
+        }
+    }
+
+    fn scroll_diff(&self, dv: &mut DiffView, n: isize) {
+        if self.smooth {
+            dv.scroller.push(n, Instant::now());
+        } else {
+            dv.shift(n);
+        }
+    }
+
+    /// Is an animation running in the current view?
+    fn scroll_active(&self) -> bool {
+        match &self.mode {
+            Mode::Normal => self.scroller.active(),
+            Mode::Diff(dv) => dv.scroller.active(),
+            Mode::Side(sv) => sv.scroll_active(),
+            _ => false,
+        }
+    }
+
+    /// Move the view by what the running animation says is due now.
+    fn tick_scroll(&mut self) {
+        match &mut self.mode {
+            Mode::Normal => {
+                let d = self.scroller.tick(Instant::now());
+                if d != 0 {
+                    self.mv(d);
+                }
+            }
+            Mode::Diff(dv) => {
+                let d = dv.scroller.tick(Instant::now());
+                dv.shift(d);
+            }
+            Mode::Side(sv) => sv.tick_scroll(),
+            _ => {}
+        }
+    }
+
+    /// Finish running animations at once (before another key is handled).
+    fn flush_scroll(&mut self) {
+        let d = self.scroller.flush();
+        if d != 0 {
+            self.mv(d);
+        }
+        if let Mode::Diff(dv) = &mut self.mode {
+            let d = dv.scroller.flush();
+            dv.shift(d);
+        }
     }
 
     // ── navigation ──
@@ -914,8 +1013,10 @@ impl App {
             row.right.is_some(),
         ) {
             Ok(mut v) => {
+                v.set_readonly(self.readonly.0, self.readonly.1);
                 v.set_syntax(self.syntax);
                 v.set_chunk_bg(self.chunk_bg);
+                v.set_smooth(self.smooth);
                 self.mode = Mode::Side(Box::new(v));
             }
             Err(fd) => self.mode = Mode::Diff(DiffView::new(&row.rel, fd)),
@@ -946,7 +1047,7 @@ impl App {
         let Some(row) = self.rows.get(self.cursor).cloned() else {
             return Ok(());
         };
-        if row.is_dir {
+        if row.is_dir || self.deny(self.focus) {
             return Ok(());
         }
         let (first, second) = match self.focus {
@@ -971,6 +1072,19 @@ impl App {
         Ok(())
     }
 
+    /// True (and a message) when `side` is a read-only git snapshot.
+    fn deny(&mut self, side: Side) -> bool {
+        let ro = if side == Side::Left { self.readonly.0 } else { self.readonly.1 };
+        if ro {
+            let name = match &self.labels {
+                Some(l) => if side == Side::Left { l.0.clone() } else { l.1.clone() },
+                None => side.name().to_string(),
+            };
+            self.msg = format!("the {} side ({name}) is a read-only git snapshot", side.name());
+        }
+        ro
+    }
+
     fn start_copy(&mut self, to: Side) {
         let Some(row) = self.rows.get(self.cursor).cloned() else {
             return;
@@ -979,6 +1093,9 @@ impl App {
             Side::Right => (&row.left, &row.right),
             Side::Left => (&row.right, &row.left),
         };
+        if self.deny(to) {
+            return;
+        }
         if from_meta.is_none() {
             self.msg = format!("'{}' is missing on the {} side", row.name, to.other().name());
             return;
@@ -1011,6 +1128,9 @@ impl App {
         let Some(row) = self.rows.get(self.cursor).cloned() else {
             return;
         };
+        if self.deny(self.focus) {
+            return;
+        }
         let meta = match self.focus {
             Side::Left => &row.left,
             Side::Right => &row.right,
@@ -1209,6 +1329,7 @@ impl App {
                 if self.cli_no_syntax { "--no-syntax is on this run".into() } else { String::new() },
             ),
             6 => (format!("{} Chunk background colours", mark(self.prefs.chunk_bg)), String::new()),
+            7 => (format!("{} Smooth scrolling", mark(self.prefs.smooth)), String::new()),
             _ => (
                 format!(
                     "    External diff command: {}",
@@ -1226,6 +1347,10 @@ impl App {
         self.nerd_font = self.prefs.nerd_font;
         self.syntax = self.prefs.syntax && !self.cli_no_syntax;
         self.chunk_bg = self.prefs.chunk_bg;
+        self.smooth = self.prefs.smooth;
+        if !self.smooth {
+            self.flush_scroll();
+        }
         self.diff_cmd = self.cli_diff.clone().or_else(|| self.prefs.diff_command.clone());
         self.opts.compare_dates = self.cli_dates || self.prefs.compare_dates;
         self.opts.compare_contents = self.prefs.compare_contents && !self.cli_quick;
@@ -1292,13 +1417,14 @@ impl App {
                     4 => self.prefs.nerd_font = !self.prefs.nerd_font,
                     5 => self.prefs.syntax = !self.prefs.syntax,
                     6 => self.prefs.chunk_bg = !self.prefs.chunk_bg,
+                    7 => self.prefs.smooth = !self.prefs.smooth,
                     _ => {
                         if key.code == KeyCode::Enter {
                             ui.editing = Some(self.prefs.diff_command.clone().unwrap_or_default());
                         }
                     }
                 }
-                if ui.sel < 7 {
+                if ui.sel < 8 {
                     self.prefs_changed(ui.sel);
                 }
             }
@@ -1892,11 +2018,16 @@ fn draw_panels(f: &mut Frame, area: Rect, app: &App) {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
     for (i, side) in [Side::Left, Side::Right].into_iter().enumerate() {
-        let root = if side == Side::Left { &app.left } else { &app.right };
+        let root = match (&app.labels, side) {
+            (Some(l), Side::Left) => l.0.clone(),
+            (Some(l), Side::Right) => l.1.clone(),
+            (None, Side::Left) => app.left.display().to_string(),
+            (None, Side::Right) => app.right.display().to_string(),
+        };
         let focused = app.focus == side;
         let block = Block::default()
             .borders(Borders::ALL)
-            .title(format!(" {} ", root.display()))
+            .title(format!(" {root} "))
             .border_style(Style::default().fg(if focused { Color::Green } else { Color::DarkGray }));
         let inner = block.inner(cols[i]);
         let width = inner.width as usize;
@@ -2159,6 +2290,8 @@ mod tests {
             cli_quick: false,
             cli_diff: diff_cmd.map(String::from),
             cli_no_syntax: false,
+            readonly: (false, false),
+            labels: None,
             keymap,
             key_warnings: Vec::new(),
             config_file: Some(root.join("cfg/config.json")),
@@ -2367,6 +2500,97 @@ mod tests {
         select(&mut app, "x.txt");
         keys(&mut app, "D");
         assert!(matches!(&app.mode, Mode::Diff(dv) if !dv.chunk_bg));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn ctrl_key(app: &mut App, c: char) {
+        app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL), &mut Rec::default()).unwrap();
+    }
+
+    #[test]
+    fn page_keys_scroll_smoothly_in_the_directory_view() {
+        let root = tmp();
+        for i in 0..60 {
+            put(root.join(format!("l/f{i:02}")), "x");
+        }
+        fs::create_dir_all(root.join("r")).unwrap();
+        let mut app = build(&root, None);
+        app.view_h = 20;
+        assert!(app.smooth);
+        // the key only starts the animation
+        ctrl_key(&mut app, 'd');
+        assert_eq!(app.cursor, 0);
+        assert!(app.scroll_active());
+        assert_eq!(app.scroller.remaining(), 10);
+        // more of the same adds up, the opposite direction cancels
+        ctrl_key(&mut app, 'd');
+        assert_eq!(app.scroller.remaining(), 20);
+        ctrl_key(&mut app, 'u');
+        assert_eq!(app.scroller.remaining(), -10);
+        ctrl_key(&mut app, 'd');
+        assert_eq!(app.scroller.remaining(), 10);
+        // any other key finishes the animation first, then acts
+        keys(&mut app, "j");
+        assert!(!app.scroll_active());
+        assert_eq!(app.cursor, 11);
+        // time does the same without a key
+        code(&mut app, KeyCode::PageDown);
+        assert!(app.scroll_active());
+        std::thread::sleep(Duration::from_millis(700));
+        app.tick_scroll();
+        assert_eq!(app.cursor, 31);
+        assert!(!app.scroll_active());
+        // clamped at the end, and no animation left behind
+        for _ in 0..5 {
+            ctrl_key(&mut app, 'f');
+        }
+        keys(&mut app, "k");
+        assert_eq!(app.cursor, app.rows.len() - 2);
+        // off: immediate
+        app.prefs.smooth = false;
+        app.apply_prefs();
+        app.cursor = 0;
+        ctrl_key(&mut app, 'd');
+        assert_eq!(app.cursor, 10);
+        assert!(!app.scroll_active());
+        // turning it off mid-animation applies what was left
+        app.prefs.smooth = true;
+        app.apply_prefs();
+        ctrl_key(&mut app, 'd');
+        app.prefs.smooth = false;
+        app.apply_prefs();
+        assert_eq!(app.cursor, 20);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn page_keys_scroll_smoothly_in_the_unified_view() {
+        let root = tmp();
+        let a: String = (0..100).map(|i| format!("a{i}\n")).collect();
+        let b: String = (0..100).map(|i| format!("b{i}\n")).collect();
+        put(root.join("l/big.txt"), &a);
+        put(root.join("r/big.txt"), &b);
+        let mut app = build(&root, None);
+        select(&mut app, "big.txt");
+        keys(&mut app, "D");
+        app.view_h = 20;
+        ctrl_key(&mut app, 'd');
+        let Mode::Diff(dv) = &app.mode else { panic!("unified diff") };
+        assert_eq!(dv.scroll, 0);
+        assert!(app.scroll_active());
+        keys(&mut app, "j");
+        let Mode::Diff(dv) = &app.mode else { panic!("unified diff") };
+        assert_eq!(dv.scroll, 11);
+        assert!(!dv.scroller.active());
+        ctrl_key(&mut app, 'f');
+        std::thread::sleep(Duration::from_millis(700));
+        app.tick_scroll();
+        let Mode::Diff(dv) = &app.mode else { panic!("unified diff") };
+        assert_eq!(dv.scroll, 31);
+        // leaving the view with an animation pending is harmless
+        ctrl_key(&mut app, 'd');
+        keys(&mut app, "q");
+        assert!(matches!(app.mode, Mode::Normal) && !app.scroll_active());
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -2973,6 +3197,10 @@ mod tests {
         keys(&mut app, "j ");
         assert!(!app.chunk_bg && !app.prefs.chunk_bg);
         assert!(!config::load_from(&file).0.chunk_bg);
+        assert!(app.smooth);
+        keys(&mut app, "j ");
+        assert!(!app.smooth && !app.prefs.smooth);
+        assert!(!config::load_from(&file).0.smooth);
 
         // external diff command: Enter edits, typing, Enter saves
         keys(&mut app, "j");
@@ -3139,6 +3367,63 @@ mod tests {
         keys(&mut app, "n");
         assert!(app.msg.starts_with("not saved"), "{}", app.msg);
         assert_eq!(app.keymap.keys_for(0), vec!["n".to_string()], "still applies this run");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_only_snapshot_sides_refuse_changes() {
+        let (root, mut app) = basic();
+        app.readonly = (true, false);
+        app.labels = Some(("HEAD".to_string(), "working tree".to_string()));
+        select(&mut app, "x.txt");
+        let l = root.join("l/a/x.txt");
+        let r = root.join("r/a/x.txt");
+        // copy into the snapshot, delete on it, edit it: all refused, nothing touched
+        keys(&mut app, "<");
+        assert!(app.msg.contains("read-only git snapshot") && app.msg.contains("HEAD"), "{}", app.msg);
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(fs::read_to_string(&l).unwrap(), "1\n");
+        app.focus = Side::Left;
+        keys(&mut app, "d");
+        assert!(matches!(app.mode, Mode::Normal), "no delete prompt on the snapshot");
+        assert!(l.exists());
+        keys(&mut app, "e");
+        assert!(app.msg.contains("read-only"), "{}", app.msg);
+        // the working tree side can be changed: copy HEAD's version over it (a revert)
+        keys(&mut app, ">");
+        assert!(matches!(app.mode, Mode::Confirm(_)));
+        keys(&mut app, "y");
+        assert_eq!(fs::read_to_string(&r).unwrap(), "1\n");
+        // deleting on the working tree side still asks
+        app.focus = Side::Right;
+        select(&mut app, "new.txt");
+        keys(&mut app, "d");
+        assert!(matches!(app.mode, Mode::Confirm(_)));
+        keys(&mut app, "n");
+        // swapping the panels moves the flag with the side
+        keys(&mut app, "S");
+        assert_eq!(app.readonly, (false, true));
+        assert_eq!(app.labels.as_ref().unwrap().0, "working tree");
+        keys(&mut app, "S");
+        assert_eq!(app.readonly, (true, false));
+        // and the side-by-side editor gets the same rule
+        select(&mut app, "x.txt");
+        put(root.join("l/a/x.txt"), "1\n2\n");
+        app.refresh();
+        select(&mut app, "x.txt");
+        code(&mut app, KeyCode::Enter);
+        let Mode::Side(sv) = &app.mode else { panic!("side view") };
+        assert_eq!(sv.readonly(), (true, false));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn nothing_is_read_only_without_git_mode() {
+        let (root, mut app) = basic();
+        assert_eq!(app.readonly, (false, false));
+        select(&mut app, "x.txt");
+        keys(&mut app, "<");
+        assert!(matches!(app.mode, Mode::Confirm(_)));
         let _ = fs::remove_dir_all(&root);
     }
 }
