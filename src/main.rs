@@ -5,6 +5,7 @@ mod fuzzy;
 mod git;
 mod highlight;
 mod keys;
+mod renames;
 mod side;
 mod smooth;
 #[cfg(feature = "syntect")]
@@ -116,6 +117,7 @@ fn run() -> i32 {
         compare_dates: c.compare_dates || cfg.compare_dates,
         compare_contents: cfg.compare_contents && !c.quick,
         pairs: Vec::new(),
+        detect_renames: cfg.renames && !c.no_renames,
     };
 
     match c.cmd {
@@ -137,6 +139,7 @@ fn run() -> i32 {
                 cli_quick: c.quick,
                 cli_diff: c.diff_cmd,
                 cli_no_syntax: c.no_syntax,
+                cli_no_renames: c.no_renames,
                 readonly: session.as_ref().map_or((false, false), |s| s.readonly),
                 labels: session.as_ref().map(|s| s.labels.clone()),
                 keymap,

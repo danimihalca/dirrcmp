@@ -27,6 +27,8 @@ pub struct Config {
     pub chunk_bg: bool,
     /// `smoothScroll`: ease page scrolling (^d ^u ^f ^b, PageUp/Down) over a few frames.
     pub smooth: bool,
+    /// `detectRenames`: pair files that exist on one side only with same/similar content elsewhere.
+    pub renames: bool,
     /// `diffCommand`: external diff for Enter on a file, e.g. `nvim -d`.
     pub diff_command: Option<String>,
 }
@@ -42,6 +44,7 @@ impl Default for Config {
             syntax: true,
             chunk_bg: true,
             smooth: true,
+            renames: true,
             diff_command: None,
         }
     }
@@ -304,6 +307,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
                 "syntaxHighlight" => cfg.syntax = want_bool(val)?,
                 "chunkBackground" => cfg.chunk_bg = want_bool(val)?,
                 "smoothScroll" => cfg.smooth = want_bool(val)?,
+                "detectRenames" => cfg.renames = want_bool(val)?,
                 "diffCommand" => match val {
                     Val::Str(s) => cfg.diff_command = if s.trim().is_empty() { None } else { Some(s) },
                     Val::Other => cfg.diff_command = None, // null
@@ -362,6 +366,7 @@ pub fn to_json(c: &Config) -> String {
     s.push_str(&format!("  \"syntaxHighlight\": {},\n", c.syntax));
     s.push_str(&format!("  \"chunkBackground\": {},\n", c.chunk_bg));
     s.push_str(&format!("  \"smoothScroll\": {},\n", c.smooth));
+    s.push_str(&format!("  \"detectRenames\": {},\n", c.renames));
     match &c.diff_command {
         Some(d) => s.push_str(&format!("  \"diffCommand\": {}\n", json_str(d))),
         None => s.push_str("  \"diffCommand\": null\n"),

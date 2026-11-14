@@ -24,6 +24,7 @@ OPTIONS:
         --staged              with --git: compare against the index instead of the working tree
         --repo <DIR>          with --git: repository to use (default: current directory)
         --no-syntax           no syntax highlighting in the diff views
+        --no-renames          don't pair moved/renamed files (same or similar content)
         --ignore <PATTERN>    add a gitignore-style pattern (repeatable)
         --follow-symlinks     follow symlinks instead of comparing link targets
         --dates               also treat differing modification times as a difference
@@ -44,7 +45,7 @@ saved per pair of directories in the pairs/ folder next to it and also apply
 to 'diff' and 'check'.
 Preferences live in $XDG_CONFIG_HOME/dirrcmp/config.json (default
 ~/.config/dirrcmp/config.json): compareDates, compareContents, dirsFirst,
-showHints, nerdFont, syntaxHighlight, chunkBackground, smoothScroll, diffCommand.
+showHints, nerdFont, syntaxHighlight, chunkBackground, smoothScroll, detectRenames, diffCommand.
 ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +71,7 @@ pub struct Cli {
     pub right: Option<PathBuf>,
     pub no_ignore: bool,
     pub no_syntax: bool,
+    pub no_renames: bool,
     pub ignore: Vec<String>,
     pub follow_symlinks: bool,
     pub compare_dates: bool,
@@ -112,6 +114,7 @@ pub fn parse_args(args: Vec<String>) -> Result<Cli, String> {
     let mut version = false;
     let mut no_ignore = false;
     let mut no_syntax = false;
+    let mut no_renames = false;
     let mut ignore = Vec::new();
     let mut follow_symlinks = false;
     let mut compare_dates = false;
@@ -142,6 +145,7 @@ pub fn parse_args(args: Vec<String>) -> Result<Cli, String> {
             "-v" | "--version" => version = true,
             "--no-ignore" => no_ignore = true,
             "--no-syntax" => no_syntax = true,
+            "--no-renames" => no_renames = true,
             "--git" => git = true,
             "--staged" | "--cached" => staged = true,
             "--repo" => repo = Some(take_value("--repo", inline, &mut it)?),
@@ -211,7 +215,7 @@ pub fn parse_args(args: Vec<String>) -> Result<Cli, String> {
         }
     };
 
-    Ok(Cli { cmd, left, right, no_ignore, no_syntax, ignore, follow_symlinks, compare_dates, quick, diff_cmd, git })
+    Ok(Cli { cmd, left, right, no_ignore, no_syntax, no_renames, ignore, follow_symlinks, compare_dates, quick, diff_cmd, git })
 }
 
 // ───────────────────────────── ignore loading ─────────────────────────────
@@ -296,6 +300,19 @@ pub fn build_ignore_full(cli: &Cli) -> Ignore {
 
 // ───────────────────────────── renderers ─────────────────────────────
 
+/// `a/old.txt -> b/new.txt (87%)` style text for a detected rename; only the
+/// names are shown when both are in the same directory.
+fn rename_text(n: &Node, pct: u8) -> String {
+    let (o, w) = (engine::rel_string(&n.rel), engine::rel_string(&n.rrel));
+    let shown = if n.rel.parent() == n.rrel.parent() {
+        let name = |p: &Path| p.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+        format!("{} -> {}", name(&n.rel), name(&n.rrel))
+    } else {
+        format!("{o} -> {w}")
+    };
+    if pct >= 100 { shown } else { format!("{shown} ({pct}%)") }
+}
+
 fn marker(s: Status) -> char {
     match s {
         Status::Modified => '~',
@@ -321,18 +338,30 @@ fn wanted(s: Status, filter: &[Status]) -> bool {
 /// A directory present on both sides whose contents differ: we recurse into it
 /// rather than reporting it as an entry itself.
 fn is_container(n: &Node) -> bool {
-    n.is_dir() && n.status == Status::Modified
+    n.is_dir() && (n.status == Status::Modified || n.contains_rename())
 }
 
 /// Flat list of differing entries as (path, status, is_dir). One-sided
 /// directories are reported as a single entry, not expanded.
-pub fn collect_entries(root: &Node, filter: &[Status]) -> Vec<(String, Status, bool)> {
-    fn rec(n: &Node, filter: &[Status], out: &mut Vec<(String, Status, bool)>) {
+/// `(path, status, is_dir, rename)` where `rename` is `(old path, similarity %)`
+/// for a detected rename (then `path` is the new path).
+pub type Entry = (String, Status, bool, Option<(String, u8)>);
+
+pub fn collect_entries(root: &Node, filter: &[Status]) -> Vec<Entry> {
+    fn rec(n: &Node, filter: &[Status], out: &mut Vec<Entry>) {
         for c in &n.children {
             if is_container(c) {
                 rec(c, filter, out);
             } else if wanted(c.status, filter) {
-                out.push((engine::rel_string(&c.rel), c.status, c.is_dir()));
+                match c.rename {
+                    Some(p) => out.push((
+                        engine::rel_string(&c.rrel),
+                        c.status,
+                        false,
+                        Some((engine::rel_string(&c.rel), p)),
+                    )),
+                    None => out.push((engine::rel_string(&c.rel), c.status, c.is_dir(), None)),
+                }
             }
         }
     }
@@ -353,8 +382,15 @@ fn has_match(n: &Node, filter: &[Status]) -> bool {
 
 pub fn render_flat(root: &Node, filter: &[Status]) -> String {
     let mut s = String::new();
-    for (p, st, is_dir) in collect_entries(root, filter) {
-        let _ = writeln!(s, "{} {}{}", marker(st), p, if is_dir { "/" } else { "" });
+    for (p, st, is_dir, rn) in collect_entries(root, filter) {
+        match rn {
+            Some((old, pct)) => {
+                let _ = writeln!(s, "R {old} -> {p}{}", if pct >= 100 { String::new() } else { format!(" ({pct}%)") });
+            }
+            None => {
+                let _ = writeln!(s, "{} {}{}", marker(st), p, if is_dir { "/" } else { "" });
+            }
+        }
     }
     s
 }
@@ -369,6 +405,10 @@ pub fn render_tree(root: &Node, filter: &[Status]) -> String {
                     rec(c, depth + 1, filter, out);
                 }
             } else if wanted(c.status, filter) {
+                if let Some(pct) = c.rename {
+                    let _ = writeln!(out, "R {indent}{}", rename_text(c, pct));
+                    continue;
+                }
                 let _ = writeln!(
                     out,
                     "{} {indent}{}{}",
@@ -405,17 +445,30 @@ fn json_escape(s: &str) -> String {
 pub fn render_json(root: &Node, filter: &[Status]) -> String {
     let entries = collect_entries(root, filter);
     let mut s = String::from("[");
-    for (i, (p, st, is_dir)) in entries.iter().enumerate() {
+    for (i, (p, st, is_dir, rn)) in entries.iter().enumerate() {
         if i > 0 {
             s.push(',');
         }
-        let _ = write!(
-            s,
-            "\n  {{\"path\":\"{}\",\"status\":\"{}\",\"type\":\"{}\"}}",
-            json_escape(p),
-            status_name(*st),
-            if *is_dir { "dir" } else { "file" }
-        );
+        match rn {
+            Some((old, pct)) => {
+                let _ = write!(
+                    s,
+                    "\n  {{\"path\":\"{}\",\"status\":\"renamed\",\"type\":\"file\",\"from\":\"{}\",\"similarity\":{}}}",
+                    json_escape(p),
+                    json_escape(old),
+                    pct
+                );
+            }
+            None => {
+                let _ = write!(
+                    s,
+                    "\n  {{\"path\":\"{}\",\"status\":\"{}\",\"type\":\"{}\"}}",
+                    json_escape(p),
+                    status_name(*st),
+                    if *is_dir { "dir" } else { "file" }
+                );
+            }
+        }
     }
     if !entries.is_empty() {
         s.push('\n');
@@ -426,8 +479,9 @@ pub fn render_json(root: &Node, filter: &[Status]) -> String {
 
 pub fn render_stat(root: &Node) -> String {
     let st = engine::stats(root);
+    let renamed = if st.renamed > 0 { format!(", {} renamed", st.renamed) } else { String::new() };
     format!(
-        "{} modified, {} left-only, {} right-only, {} identical\n",
+        "{} modified, {} left-only, {} right-only, {} identical{renamed}\n",
         st.modified, st.left_only, st.right_only, st.identical
     )
 }
@@ -526,6 +580,41 @@ mod tests {
         let mut t = compare(&l, &r, &Opts::default());
         sort_tree(&mut t, SortKey::Name, true);
         (root, t)
+    }
+
+    #[test]
+    fn renames_in_the_outputs() {
+        let (root, _) = sample();
+        let (l, r) = (root.join("l"), root.join("r"));
+        let body: String = (0..10).map(|i| format!("row {i} of text\n")).collect();
+        let edited = body.replace("row 3 of text", "changed");
+        for (p, c) in [
+            (l.join("m/old.txt"), &body),
+            (r.join("n/new.txt"), &body),
+            (l.join("q/f.rs"), &body),
+            (r.join("q/g.rs"), &edited),
+        ] {
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, c).unwrap();
+        }
+        let on = Opts { detect_renames: true, ..Opts::default() };
+        let mut t = compare(&l, &r, &on);
+        sort_tree(&mut t, SortKey::Name, true);
+        let flat = render_flat(&t, &[]);
+        assert!(flat.contains("R m/old.txt -> n/new.txt\n"), "{flat}");
+        assert!(flat.contains("R q/f.rs -> q/g.rs ("), "{flat}");
+        let tree = render_tree(&t, &[]);
+        assert!(tree.contains("R   m/old.txt -> n/new.txt\n"), "{tree}");
+        assert!(tree.contains("R   f.rs -> g.rs ("), "{tree}");
+        let j = render_json(&t, &[]);
+        assert!(j.contains("\"path\":\"n/new.txt\",\"status\":\"renamed\",\"type\":\"file\",\"from\":\"m/old.txt\",\"similarity\":100"), "{j}");
+        assert!(render_stat(&t).ends_with(", 2 renamed\n"), "{}", render_stat(&t));
+        // off: plain one-sided files and the old stat line
+        let t = compare(&l, &r, &Opts::default());
+        assert!(render_flat(&t, &[]).contains("- m/\n"));
+        assert!(!render_stat(&t).contains("renamed"));
+        assert!(parse_args(args("--no-renames a b")).unwrap().no_renames);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

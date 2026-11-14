@@ -10,6 +10,15 @@ Single binary, Linux / macOS / Windows, no VCS needed.
     cargo test                   # engine, CLI, config, undo, side-by-side and TUI logic
     ./target/release/dirrcmp LEFT RIGHT
 
+## Homebrew (macOS, Linux)
+
+    brew tap you/dirrcmp https://github.com/you/dirrcmp    # the repo's Formula/ directory is the tap
+    brew install dirrcmp                # builds from the release tarball with Homebrew's rust
+    brew install --HEAD dirrcmp         # or the latest main branch
+
+`Formula/dirrcmp.rb` needs the release tag's `sha256` filled in, and `Cargo.lock` committed
+(`cargo generate-lockfile`). Without a tap: `cargo install --path .` puts `dirrcmp` in `~/.cargo/bin`.
+
 ## Nix
 
     cargo generate-lockfile && git add Cargo.lock flake.nix   # once; flakes only see tracked files
@@ -29,7 +38,7 @@ use it in a NixOS or home-manager config (`pkgs.dirrcmp`).
     dirrcmp diff  LEFT RIGHT            print differences (--format tree|flat|json, --filter, --stat)
     dirrcmp check LEFT RIGHT            silent, exit 0 if identical / 1 if different (CI)
 
-    --no-ignore  --ignore PATTERN (repeatable)  --follow-symlinks  --dates  --quick  --no-syntax
+    --no-ignore  --ignore PATTERN (repeatable)  --follow-symlinks  --dates  --quick  --no-syntax  --no-renames
     --diff-cmd "nvim -d"   (or env DIRCMP_DIFF)  external diff for Enter in the TUI
 
 Ignored by default: `.git`, `node_modules`, `.DS_Store`. More patterns come from
@@ -155,6 +164,19 @@ copying from the snapshot into the working tree, which reverts a file (`>` in th
 single hunk / line (`>` / `.` in the side-by-side editor). Only the `git` command is used, no
 library. Untracked files show up as right-only. Submodule contents and LFS data are not
 compared (LFS files compare as their pointer files).
+
+## Renamed and moved files
+
+Files that exist on one side only are matched with one-sided files on the other side, like
+`git diff -M`: first identical content (empty files are never matched), then similar text
+(at least 50 % of the lines, edited *and* moved). A match is one **cyan** row, shown where the
+file lives on the right; the left panel shows the old path. `diff`/`check` print
+`R old -> new (87%)`, `--format json` gives `"status":"renamed","from":...,"similarity":...`,
+`--stat` adds `N renamed`. Each file is used once; a matching base name or directory wins ties.
+
+- `Enter` opens the pair in the side-by-side editor; `>` / `<` copy the content over the other path.
+- `R` renames the file on the focused side to the other side's path (undo with `u`).
+- Off with `,` → *Detect renamed / moved files* (`detectRenames`) or `--no-renames` (one run).
 
 ## Smooth scrolling
 

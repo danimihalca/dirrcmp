@@ -23,9 +23,14 @@ static SESSION: AtomicUsize = AtomicUsize::new(0);
 pub enum Recipe {
     Copy { src: PathBuf, dst: PathBuf, rel: PathBuf, follow: bool, ignore: Ignore },
     Delete { path: PathBuf },
+    /// Move/rename `from` to `to` (nothing is overwritten).
+    Move { from: PathBuf, to: PathBuf },
 }
 
 impl Recipe {
+    pub fn rename(from: PathBuf, to: PathBuf) -> Recipe {
+        Recipe::Move { from, to }
+    }
     pub fn copy(src: PathBuf, dst: PathBuf, rel: PathBuf, follow: bool, ignore: Ignore) -> Recipe {
         Recipe::Copy { src, dst, rel, follow, ignore }
     }
@@ -36,6 +41,7 @@ impl Recipe {
         match self {
             Recipe::Copy { rel, .. } => format!("copy of {}", engine::rel_string(rel)),
             Recipe::Delete { path } => format!("delete of {}", path.display()),
+            Recipe::Move { from, to } => format!("move of {} to {}", from.display(), to.display()),
         }
     }
 }
@@ -164,6 +170,23 @@ impl Journal {
                 move_path(path, &slot)?;
                 Ok(Done { recipe: r, backup: Some(slot), made_dirs: Vec::new() })
             }
+            Recipe::Move { from, to } => {
+                fs::symlink_metadata(from)?;
+                if fs::symlink_metadata(to).is_ok() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!("{} already exists", to.display()),
+                    ));
+                }
+                let made_dirs = missing_ancestors(to);
+                if let Err(e) = move_path(from, to) {
+                    for d in &made_dirs {
+                        let _ = fs::remove_dir(d);
+                    }
+                    return Err(e);
+                }
+                Ok(Done { recipe: r, backup: None, made_dirs })
+            }
         }
     }
 
@@ -194,6 +217,19 @@ impl Journal {
                     io::Error::new(io::ErrorKind::NotFound, "backup is missing")
                 })?;
                 move_path(b, path)
+            }
+            Recipe::Move { from, to } => {
+                if fs::symlink_metadata(from).is_ok() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!("{} exists again; cannot undo the move", from.display()),
+                    ));
+                }
+                move_path(to, from)?;
+                for dir in &d.made_dirs {
+                    let _ = fs::remove_dir(dir); // only if now empty
+                }
+                Ok(())
             }
         }
     }
@@ -410,6 +446,28 @@ mod tests {
         j.undo().unwrap();
         j.run(cp(&root.join("l/b"), &root.join("r/b"), "b")).unwrap();
         assert!(j.redo().unwrap().is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn move_undo_redo_and_refusals() {
+        let root = tmp();
+        write(&root.join("r/a/old.txt"), "data");
+        let mut j = Journal::new();
+        j.run(Recipe::rename(root.join("r/a/old.txt"), root.join("r/b/c/new.txt"))).unwrap();
+        assert!(!root.join("r/a/old.txt").exists());
+        assert_eq!(read(&root.join("r/b/c/new.txt")), "data");
+        assert!(j.undo().unwrap().is_some());
+        assert_eq!(read(&root.join("r/a/old.txt")), "data");
+        assert!(!root.join("r/b").exists(), "directories made for the move are removed again");
+        assert!(j.redo().unwrap().is_some());
+        assert_eq!(read(&root.join("r/b/c/new.txt")), "data");
+        // never overwrites, and a missing source is an error that records nothing
+        write(&root.join("r/x"), "x");
+        assert!(j.run(Recipe::rename(root.join("r/x"), root.join("r/b/c/new.txt"))).is_err());
+        assert_eq!(read(&root.join("r/b/c/new.txt")), "data");
+        assert!(j.run(Recipe::rename(root.join("r/none"), root.join("r/y"))).is_err());
+        assert_eq!(j.undo.len(), 1);
         let _ = fs::remove_dir_all(&root);
     }
 

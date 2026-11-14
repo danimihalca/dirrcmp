@@ -382,7 +382,7 @@ mod tests {
         for p in &s.ignores {
             ig.add(p);
         }
-        let opts = Opts { ignore: ig, follow_symlinks: false, compare_dates: false, compare_contents: true, pairs: Vec::new() };
+        let opts = Opts { ignore: ig, follow_symlinks: false, compare_dates: false, compare_contents: true, pairs: Vec::new(), detect_renames: false };
         let tree = engine::compare(&s.left, &s.right, &opts);
         let mut names: Vec<(String, Status)> = tree.children.iter().map(|c| (c.name.clone(), c.status)).collect();
         names.sort_by(|a, b| a.0.cmp(&b.0));

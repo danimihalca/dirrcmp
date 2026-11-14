@@ -40,6 +40,8 @@ pub struct Config {
     pub cli_diff: Option<String>,
     /// `--no-syntax`: no highlighting for this run, whatever the preferences say.
     pub cli_no_syntax: bool,
+    /// `--no-renames`: no rename detection for this run.
+    pub cli_no_renames: bool,
     /// Sides that are read-only snapshots (git mode): (left, right).
     pub readonly: (bool, bool),
     /// Panel titles to show instead of the paths (git mode): (left, right).
@@ -223,6 +225,8 @@ struct Row {
     status: Status,
     left: Option<Meta>,
     right: Option<Meta>,
+    /// Detected rename/move: similarity in percent (`rel` is the old path, `rrel` the new one).
+    rename: Option<u8>,
 }
 
 fn flatten(nodes: &[Node], depth: usize, expanded: &HashSet<PathBuf>, f: &Filter, out: &mut Vec<Row>) {
@@ -252,6 +256,7 @@ fn flatten(nodes: &[Node], depth: usize, expanded: &HashSet<PathBuf>, f: &Filter
             status: n.status,
             left: n.left.clone(),
             right: n.right.clone(),
+            rename: n.rename,
         });
         if exp {
             flatten(&n.children, depth + 1, expanded, f, out);
@@ -268,6 +273,7 @@ struct FileEntry {
     status: Status,
     left: Option<engine::Meta>,
     right: Option<engine::Meta>,
+    rename: Option<u8>,
 }
 
 impl FileEntry {
@@ -279,6 +285,7 @@ impl FileEntry {
             status: r.status,
             left: r.left.clone(),
             right: r.right.clone(),
+            rename: r.rename,
         }
     }
 
@@ -294,12 +301,14 @@ impl FileEntry {
             status: self.status,
             left: self.left.clone(),
             right: self.right.clone(),
+            rename: self.rename,
         }
     }
 
-    /// Path shown (and matched) in the picker.
+    /// Path shown (and matched) in the picker: the new path for a renamed file.
     fn label(&self) -> String {
-        self.rel.to_string_lossy().replace('\\', "/")
+        let p = if self.rename.is_some() { &self.rrel } else { &self.rel };
+        p.to_string_lossy().replace('\\', "/")
     }
 }
 
@@ -315,6 +324,7 @@ fn collect_files(nodes: &[Node], out: &mut Vec<FileEntry>) {
                 status: n.status,
                 left: n.left.clone(),
                 right: n.right.clone(),
+                rename: n.rename,
             });
         }
     }
@@ -353,7 +363,7 @@ impl PickerUi {
 
 fn collect_dirs(n: &Node, only_modified: bool, out: &mut HashSet<PathBuf>) {
     for c in &n.children {
-        if c.is_dir() && (!only_modified || c.status == Status::Modified) {
+        if c.is_dir() && (!only_modified || c.status == Status::Modified || c.contains_rename()) {
             out.insert(c.rel.clone());
             collect_dirs(c, only_modified, out);
         }
@@ -480,7 +490,7 @@ struct PrefsUi {
     editing: Option<String>,
 }
 
-const PREF_ROWS: usize = 9;
+const PREF_ROWS: usize = 10;
 
 struct KeysUi {
     sel: usize,
@@ -528,6 +538,7 @@ struct App {
     cli_quick: bool,
     cli_diff: Option<String>,
     cli_no_syntax: bool,
+    cli_no_renames: bool,
     readonly: (bool, bool),
     labels: Option<(String, String)>,
     syntax: bool,
@@ -568,6 +579,7 @@ impl App {
         let mut opts = cfg.opts;
         opts.compare_dates = cfg.cli_dates || cfg.prefs.compare_dates;
         opts.compare_contents = cfg.prefs.compare_contents && !cfg.cli_quick;
+        opts.detect_renames = cfg.prefs.renames && !cfg.cli_no_renames;
         opts.ignore = if cfg.ignore_on {
             let mut ig = cfg.ignore_all.clone();
             for l in &pair_lines {
@@ -607,6 +619,7 @@ impl App {
             cli_dates: cfg.cli_dates,
             cli_quick: cfg.cli_quick,
             cli_no_syntax: cfg.cli_no_syntax,
+            cli_no_renames: cfg.cli_no_renames,
             readonly: cfg.readonly,
             labels: cfg.labels,
             cli_diff: cfg.cli_diff,
@@ -886,6 +899,7 @@ impl App {
                 self.start_copy(to)
             }
             KeyCode::Char('d') => self.start_delete(),
+            KeyCode::Char('R') => self.apply_rename(),
             KeyCode::Char('y') => self.yank(),
             KeyCode::Char('e') => self.open_editor(term)?,
             KeyCode::Char('r') => {
@@ -1501,6 +1515,10 @@ impl App {
             self.msg = "already identical".to_string();
             return;
         }
+        if row.rename == Some(100) {
+            self.msg = "same content under another path: R renames, > / < would only rewrite it".to_string();
+            return;
+        }
         let action = Action::Copy {
             src: self.path_of(&row, to.other()),
             dst: self.path_of(&row, to),
@@ -1519,6 +1537,42 @@ impl App {
         } else {
             self.perform(action);
         }
+    }
+
+    /// `R`: make the focused side use the other side's path for a renamed/moved file.
+    fn apply_rename(&mut self) {
+        let Some(row) = self.rows.get(self.cursor).cloned() else {
+            return;
+        };
+        if row.rename.is_none() {
+            self.msg = "not a renamed or moved file".to_string();
+            return;
+        }
+        if self.deny(self.focus) {
+            return;
+        }
+        let (from, to) = match self.focus {
+            Side::Left => (self.left.join(&row.rel), self.left.join(&row.rrel)),
+            Side::Right => (self.right.join(&row.rrel), self.right.join(&row.rel)),
+        };
+        let done = format!(
+            "renamed {} -> {} on the {} side",
+            engine::rel_string(match self.focus {
+                Side::Left => &row.rel,
+                Side::Right => &row.rrel,
+            }),
+            engine::rel_string(match self.focus {
+                Side::Left => &row.rrel,
+                Side::Right => &row.rel,
+            }),
+            self.focus.name()
+        );
+        let m = match self.journal.run(Recipe::rename(from, to)) {
+            Ok(()) => format!("{done}  (u to undo)"),
+            Err(e) => format!("error: {e}"),
+        };
+        self.refresh();
+        self.msg = m;
     }
 
     fn start_delete(&mut self) {
@@ -1727,6 +1781,10 @@ impl App {
             ),
             6 => (format!("{} Chunk background colours", mark(self.prefs.chunk_bg)), String::new()),
             7 => (format!("{} Smooth scrolling", mark(self.prefs.smooth)), String::new()),
+            8 => (
+                format!("{} Detect renamed / moved files", mark(self.prefs.renames)),
+                if self.cli_no_renames { "--no-renames is on this run".into() } else { "like git -M: same or ≥50% similar content".into() },
+            ),
             _ => (
                 format!(
                     "    External diff command: {}",
@@ -1751,6 +1809,7 @@ impl App {
         self.diff_cmd = self.cli_diff.clone().or_else(|| self.prefs.diff_command.clone());
         self.opts.compare_dates = self.cli_dates || self.prefs.compare_dates;
         self.opts.compare_contents = self.prefs.compare_contents && !self.cli_quick;
+        self.opts.detect_renames = self.prefs.renames && !self.cli_no_renames;
         self.refresh();
     }
 
@@ -1759,7 +1818,8 @@ impl App {
         let over = match row {
             0 if self.cli_quick => Some("--quick"),
             1 if self.cli_dates => Some("--dates"),
-            5 if self.cli_diff.is_some() => Some("--diff-cmd"),
+            8 if self.cli_no_renames => Some("--no-renames"),
+            9 if self.cli_diff.is_some() => Some("--diff-cmd"),
             _ => None,
         };
         let saved = match &self.config_file {
@@ -1780,7 +1840,7 @@ impl App {
                 KeyCode::Enter => {
                     let t = text.trim().to_string();
                     self.prefs.diff_command = if t.is_empty() { None } else { Some(t) };
-                    self.prefs_changed(5);
+                    self.prefs_changed(9);
                 }
                 KeyCode::Esc => {}
                 KeyCode::Backspace => {
@@ -1815,13 +1875,14 @@ impl App {
                     5 => self.prefs.syntax = !self.prefs.syntax,
                     6 => self.prefs.chunk_bg = !self.prefs.chunk_bg,
                     7 => self.prefs.smooth = !self.prefs.smooth,
+                    8 => self.prefs.renames = !self.prefs.renames,
                     _ => {
                         if key.code == KeyCode::Enter {
                             ui.editing = Some(self.prefs.diff_command.clone().unwrap_or_default());
                         }
                     }
                 }
-                if ui.sel < 8 {
+                if ui.sel < 9 {
                     self.prefs_changed(ui.sel);
                 }
             }
@@ -1908,6 +1969,12 @@ impl App {
                 v.push(("open", "Open side-by-side editor".to_string()));
                 v.push(("unified_diff", "Read-only unified diff".to_string()));
                 v.push(("edit", "Open in $EDITOR".to_string()));
+            }
+            if let Some(p) = row.rename {
+                v.push((
+                    "rename_apply",
+                    format!("Rename on the {} side to match the other ({p}% similar)", self.focus.name()),
+                ));
             }
             if row.status != Status::Same && row.left.is_some() {
                 v.push(("copy_right", "Copy to right".to_string()));
@@ -2198,6 +2265,20 @@ impl App {
                 format!(" {}", self.msg),
                 Style::default().fg(Color::Yellow).add_modifier(Modifier::REVERSED),
             ),
+            Mode::Normal if self.rows.get(self.cursor).map_or(false, |r| r.rename.is_some()) => {
+                let r = &self.rows[self.cursor];
+                let p = r.rename.unwrap_or(0);
+                (
+                    format!(
+                        " renamed: {} -> {}{}   R apply on the {} side",
+                        engine::rel_string(&r.rel),
+                        engine::rel_string(&r.rrel),
+                        if p >= 100 { String::new() } else { format!(" ({p}% similar)") },
+                        self.focus.name()
+                    ),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::REVERSED),
+                )
+            }
             _ => (
                 if self.show_hints {
                     " j/k move  l/h expand  Enter side-by-side  D unified  >/< copy  d delete  / filter  . actions  ? help  q quit"
@@ -2236,7 +2317,8 @@ const HELP: &str = "\
   ^p              find file (fuzzy picker; Tab: changed only)
   .               actions menu       ,    preferences       K  key bindings
 
- Colors: yellow modified, green only on this side, red missing here, dim identical
+ Colors: yellow modified, green only on this side, red missing here, dim identical,
+ cyan renamed/moved (same or similar content): R renames the focused side to match.
  Directory copy merges; nothing extra is deleted from the destination.
  Pairing: press m on a file or directory that exists on one side only, Tab to the
  other panel, press m on the renamed one (same kind, same parent). They compare as one entry.
@@ -2342,7 +2424,7 @@ fn draw_keys(f: &mut Frame, area: Rect, ui: &KeysUi, km: &Keymap) {
 fn status_style(status: Status, present: bool) -> Style {
     match (present, status) {
         (false, _) => Style::default().fg(Color::Red),
-        (true, Status::Same) => Style::default().add_modifier(Modifier::DIM),
+        (true, Status::Same) => Style::default().fg(Color::Gray),
         (true, Status::Modified) => Style::default().fg(Color::Yellow),
         (true, _) => Style::default().fg(Color::Green),
     }
@@ -2519,6 +2601,10 @@ fn own_name(row: &Row, side: Side) -> String {
         Side::Left => (&row.left, &row.rel),
         Side::Right => (&row.right, &row.rrel),
     };
+    // a file moved to another directory shows where it came from on the left
+    if row.rename.is_some() && side == Side::Left && row.rel.parent() != row.rrel.parent() {
+        return engine::rel_string(&row.rel);
+    }
     match path.file_name() {
         Some(n) if meta.is_some() => n.to_string_lossy().into_owned(),
         _ => row.name.clone(),
@@ -2564,8 +2650,9 @@ fn side_line(
     let rest = format!("{:<nw$} {:>rw$}", name, size_txt, nw = name_w, rw = right_w);
 
     let mut style = match (meta.is_some(), row.status) {
+        (true, _) if row.rename.is_some() => Style::default().fg(Color::Cyan),
         (false, _) => Style::default().fg(Color::Red),
-        (true, Status::Same) => Style::default().add_modifier(Modifier::DIM),
+        (true, Status::Same) => Style::default().fg(Color::Gray),
         (true, Status::Modified) => Style::default().fg(Color::Yellow),
         (true, _) => Style::default().fg(Color::Green),
     };
@@ -2573,6 +2660,8 @@ fn side_line(
         style = if meta.is_none() {
             // reversed red would be dark text on red; black on red stays readable
             Style::default().fg(Color::Black).bg(Color::Red)
+        } else if row.status == Status::Same && row.rename.is_none() {
+            Style::default().fg(Color::Black).bg(Color::Gray)
         } else {
             style.add_modifier(Modifier::REVERSED)
         };
@@ -2864,11 +2953,12 @@ mod tests {
             opts: Opts::default(),
             ignore_all: Ignore::defaults(),
             ignore_on: true,
-            prefs: config::Config::default(),
+            prefs: config::Config { renames: false, ..config::Config::default() },
             cli_dates,
             cli_quick: false,
             cli_diff: diff_cmd.map(String::from),
             cli_no_syntax: false,
+            cli_no_renames: false,
             readonly: (false, false),
             labels: None,
             keymap,
@@ -2918,6 +3008,68 @@ mod tests {
         put(l.join("node_modules/z"), "ignored");
         let app = build(&root, None);
         (root, app)
+    }
+
+    #[test]
+    fn renamed_files_are_one_row_and_r_applies_the_rename() {
+        let root = tmp();
+        let (l, r) = (root.join("l"), root.join("r"));
+        let body: String = (0..10).map(|i| format!("line {i} of the text\n")).collect();
+        put(l.join("a/old.txt"), &body);
+        put(r.join("b/new.txt"), &body);
+        put(l.join("keep.txt"), "k");
+        put(r.join("keep.txt"), "k");
+        let mut cfg = cfg_for(&root, None, Keymap::default(), false);
+        cfg.prefs.renames = true;
+        let mut app = App::new(cfg);
+        // one cyan row under the right-hand directory, none left over
+        let row = app.rows.iter().find(|r| r.rename.is_some()).expect("rename row").clone();
+        assert_eq!((row.name.as_str(), row.rename), ("new.txt", Some(100)));
+        assert_eq!((row.rel.clone(), row.rrel.clone()), (PathBuf::from("a/old.txt"), PathBuf::from("b/new.txt")));
+        assert_eq!(own_name(&row, Side::Left), "a/old.txt");
+        assert_eq!(own_name(&row, Side::Right), "new.txt");
+        assert!(!app.rows.iter().any(|r| r.name == "old.txt"));
+        // the status line says what happened
+        select(&mut app, "new.txt");
+        app.msg.clear();
+        // identical content: > / < refuse and point at R
+        keys(&mut app, ">");
+        assert!(app.msg.contains("R renames"), "{}", app.msg);
+        // R on the (default) left panel moves the left file to the right-hand path
+        app.focus = Side::Left;
+        keys(&mut app, "R");
+        assert!(app.msg.starts_with("renamed a/old.txt -> b/new.txt on the left side"), "{}", app.msg);
+        assert!(l.join("b/new.txt").exists() && !l.join("a/old.txt").exists());
+        assert!(app.rows.iter().all(|r| r.rename.is_none()));
+        let st = app.rows.iter().find(|r| r.name == "new.txt").unwrap().status;
+        assert_eq!(st, Status::Same);
+        // undo brings the rename back
+        keys(&mut app, "u");
+        assert!(l.join("a/old.txt").exists() && !l.join("b/new.txt").exists());
+        assert!(app.rows.iter().any(|r| r.rename.is_some()));
+        // focus on the right moves the right file to the old path instead
+        app.focus = Side::Right;
+        select(&mut app, "new.txt");
+        keys(&mut app, "R");
+        assert!(r.join("a/old.txt").exists() && !r.join("b/new.txt").exists());
+        keys(&mut app, "u");
+        // R on an ordinary row does nothing
+        select(&mut app, "keep.txt");
+        keys(&mut app, "R");
+        assert_eq!(app.msg, "not a renamed or moved file");
+        // the action menu offers it on a renamed row
+        select(&mut app, "new.txt");
+        keys(&mut app, ".");
+        assert!(action_names(&app).contains(&"rename_apply"));
+        keys(&mut app, "q");
+        // the picker shows the new path
+        assert!(app.files().iter().any(|f| f.label() == "b/new.txt"));
+        // switching detection off in the prefs splits it back into two one-sided files
+        app.prefs.renames = false;
+        app.apply_prefs();
+        assert!(app.rows.iter().all(|r| r.rename.is_none()));
+        assert!(app.rows.iter().any(|r| r.name == "a" && r.status == Status::LeftOnly));
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -3764,7 +3916,7 @@ mod tests {
     fn menu_actions_use_the_handlers_keys_even_when_rebound() {
         let (root, _) = basic();
         // `j` is no longer move_down, but the menu must still be able to run it
-        let km = keymap_of(&[("move_down", &["n"]), ("refresh", &["R"])]);
+        let km = keymap_of(&[("move_down", &["n"]), ("refresh", &["X"])]);
         let mut app = build_with(&root, None, km, false);
         keys(&mut app, ".");
         let names = action_names(&app);
@@ -3816,6 +3968,12 @@ mod tests {
         keys(&mut app, "j ");
         assert!(!app.smooth && !app.prefs.smooth);
         assert!(!config::load_from(&file).0.smooth);
+
+        // rename detection (off in these tests' base config, so this turns it on)
+        assert!(!app.opts.detect_renames);
+        keys(&mut app, "j ");
+        assert!(app.opts.detect_renames && app.prefs.renames);
+        assert!(config::load_from(&file).0.renames);
 
         // external diff command: Enter edits, typing, Enter saves
         keys(&mut app, "j");

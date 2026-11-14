@@ -39,6 +39,10 @@ pub struct Node {
     pub right: Option<Meta>,
     pub status: Status,
     pub children: Vec<Node>,
+    /// Set when this file is a detected rename/move: similarity in percent
+    /// (100 = identical content). `rel` is then the old (left) path and `rrel`
+    /// the new (right) one, and the status is `Modified`.
+    pub rename: Option<u8>,
 }
 
 impl Node {
@@ -50,6 +54,11 @@ impl Node {
             (Some(m), None) | (None, Some(m)) => m.is_dir,
             (None, None) => false,
         }
+    }
+
+    /// True when a detected rename/move is somewhere below this node.
+    pub fn contains_rename(&self) -> bool {
+        self.children.iter().any(|c| c.rename.is_some() || c.contains_rename())
     }
 
     /// True for a directory that was paired by hand with a differently named one
@@ -72,6 +81,9 @@ pub struct Opts {
     /// exists on the left and one that only exists on the right, with the same
     /// parent, compared as if they were one entry. Invalid pairs are ignored.
     pub pairs: Vec<(PathBuf, PathBuf)>,
+    /// Match files that exist on one side only with files on the other side
+    /// that have the same (or similar) content: renamed or moved files.
+    pub detect_renames: bool,
 }
 
 impl Default for Opts {
@@ -82,6 +94,7 @@ impl Default for Opts {
             compare_dates: false,
             compare_contents: true,
             pairs: Vec::new(),
+            detect_renames: false,
         }
     }
 }
@@ -491,6 +504,7 @@ fn compare_children(
             right: rmeta,
             status,
             children,
+            rename: None,
         });
     }
     out
@@ -505,7 +519,7 @@ pub fn compare(left: &Path, right: &Path, opts: &Opts) -> Node {
     } else {
         Status::Modified
     };
-    Node {
+    let mut root = Node {
         name: String::new(),
         rel: PathBuf::new(),
         rrel: PathBuf::new(),
@@ -513,7 +527,12 @@ pub fn compare(left: &Path, right: &Path, opts: &Opts) -> Node {
         right: meta_of(right, true),
         status,
         children,
+        rename: None,
+    };
+    if opts.detect_renames {
+        crate::renames::detect(&mut root, left, right);
     }
+    root
 }
 
 // ───────────────────────────── sorting ─────────────────────────────
@@ -599,6 +618,8 @@ pub struct Stats {
     pub left_only: usize,
     pub right_only: usize,
     pub identical: usize,
+    /// Detected renames/moves (not included in `modified`).
+    pub renamed: usize,
 }
 
 /// Counts files (and file-vs-dir clashes); directories themselves are not counted.
@@ -608,6 +629,8 @@ pub fn stats(n: &Node) -> Stats {
         for c in &n.children {
             if c.is_dir() {
                 rec(c, s);
+            } else if c.rename.is_some() {
+                s.renamed += 1;
             } else {
                 match c.status {
                     Status::Same => s.identical += 1,
