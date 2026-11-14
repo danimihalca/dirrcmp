@@ -509,7 +509,7 @@ mod tests {
     }
 
     fn sample() -> (PathBuf, Node) {
-        let root = std::env::temp_dir().join(format!("dirrcmp-cli-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("dirrcmp-cli-{}-{}", std::process::id(), crate::utmp::next()));
         let _ = fs::remove_dir_all(&root);
         let (l, r) = (root.join("l"), root.join("r"));
         for (p, c) in [
@@ -564,7 +564,7 @@ mod tests {
     }
     #[test]
     fn pair_ignore_files() {
-        let root = std::env::temp_dir().join(format!("dirrcmp-pairs-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("dirrcmp-pairs-{}-{}", std::process::id(), crate::utmp::next()));
         let _ = fs::remove_dir_all(&root);
         let (a, b) = (root.join("a"), root.join("b"));
         fs::create_dir_all(&a).unwrap();

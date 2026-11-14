@@ -20,7 +20,8 @@ use crate::engine::{
 };
 use crate::keys::{self, Chord, Key, Keymap, Tr};
 use crate::highlight::{self, Kind};
-use crate::side::{self, Outcome, SideView};
+use crate::fuzzy;
+use crate::side::{self, Outcome, Request, SideView};
 use crate::smooth::{self as smooth_mod, Scroller};
 use std::time::Instant;
 use crate::undo::{Journal, Recipe};
@@ -258,6 +259,98 @@ fn flatten(nodes: &[Node], depth: usize, expanded: &HashSet<PathBuf>, f: &Filter
     }
 }
 
+/// A file of the comparison, whether or not its directory is expanded in the list.
+#[derive(Clone)]
+struct FileEntry {
+    rel: PathBuf,
+    rrel: PathBuf,
+    name: String,
+    status: Status,
+    left: Option<engine::Meta>,
+    right: Option<engine::Meta>,
+}
+
+impl FileEntry {
+    fn from_row(r: &Row) -> FileEntry {
+        FileEntry {
+            rel: r.rel.clone(),
+            rrel: r.rrel.clone(),
+            name: r.name.clone(),
+            status: r.status,
+            left: r.left.clone(),
+            right: r.right.clone(),
+        }
+    }
+
+    fn to_row(&self) -> Row {
+        Row {
+            rel: self.rel.clone(),
+            rrel: self.rrel.clone(),
+            paired: false,
+            name: self.name.clone(),
+            depth: 0,
+            is_dir: false,
+            expanded: false,
+            status: self.status,
+            left: self.left.clone(),
+            right: self.right.clone(),
+        }
+    }
+
+    /// Path shown (and matched) in the picker.
+    fn label(&self) -> String {
+        self.rel.to_string_lossy().replace('\\', "/")
+    }
+}
+
+fn collect_files(nodes: &[Node], out: &mut Vec<FileEntry>) {
+    for n in nodes {
+        if n.is_dir() {
+            collect_files(&n.children, out);
+        } else {
+            out.push(FileEntry {
+                rel: n.rel.clone(),
+                rrel: n.rrel.clone(),
+                name: n.name.clone(),
+                status: n.status,
+                left: n.left.clone(),
+                right: n.right.clone(),
+            });
+        }
+    }
+}
+
+struct PickerUi {
+    query: String,
+    sel: usize,
+    top: usize,
+    changed_only: bool,
+    items: Vec<FileEntry>,
+    /// (index into `items`, matched char positions of the label), best first.
+    shown: Vec<(usize, Vec<usize>)>,
+    /// The editor to return to (the picker was opened from it).
+    back: Option<Box<SideView>>,
+}
+
+impl PickerUi {
+    fn refilter(&mut self) {
+        let mut scored: Vec<(i32, usize, Vec<usize>)> = Vec::new();
+        for (i, it) in self.items.iter().enumerate() {
+            if self.changed_only && it.status == Status::Same {
+                continue;
+            }
+            if let Some(m) = fuzzy::fuzzy(&self.query, &it.label()) {
+                scored.push((m.score, i, m.positions));
+            }
+        }
+        // best score first; ties keep the order of the tree
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        self.shown = scored.into_iter().map(|(_, i, p)| (i, p)).collect();
+        self.sel = 0;
+        self.top = 0;
+    }
+}
+
 fn collect_dirs(n: &Node, only_modified: bool, out: &mut HashSet<PathBuf>) {
     for c in &n.children {
         if c.is_dir() && (!only_modified || c.status == Status::Modified) {
@@ -407,6 +500,7 @@ enum Mode {
     Actions(ActionsUi),
     Diff(DiffView),
     Side(Box<SideView>),
+    Picker(Box<PickerUi>),
     Filter(String),
     Confirm(Confirm),
     Ignores(IgnoreUi),
@@ -440,6 +534,14 @@ struct App {
     chunk_bg: bool,
     smooth: bool,
     scroller: Scroller,
+    /// File sidebar in the side-by-side editor: shown / has the keyboard.
+    sidebar: bool,
+    sb_focus: bool,
+    sb_top: usize,
+    /// Terminal width at the last draw (the sidebar needs room).
+    term_w: u16,
+    /// The file open in the side-by-side editor (left-relative path).
+    side_rel: Option<PathBuf>,
     keymap: Keymap,
     config_file: Option<PathBuf>,
     keys_file: Option<PathBuf>,
@@ -496,6 +598,11 @@ impl App {
             chunk_bg: cfg.prefs.chunk_bg,
             smooth: cfg.prefs.smooth,
             scroller: Scroller::default(),
+            sidebar: false,
+            sb_focus: false,
+            sb_top: 0,
+            term_w: 100,
+            side_rel: None,
             prefs: cfg.prefs,
             cli_dates: cfg.cli_dates,
             cli_quick: cfg.cli_quick,
@@ -595,7 +702,9 @@ impl App {
     fn on_key(&mut self, key: KeyEvent, term: &mut dyn Host) -> io::Result<bool> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         // Ctrl-C must not throw away unsaved edits in the side-by-side view.
-        if ctrl && key.code == KeyCode::Char('c') && !matches!(self.mode, Mode::Side(_)) {
+        let editing = matches!(self.mode, Mode::Side(_))
+            || matches!(&self.mode, Mode::Picker(p) if p.back.is_some());
+        if ctrl && key.code == KeyCode::Char('c') && !editing {
             return Ok(true);
         }
         self.msg.clear();
@@ -617,14 +726,27 @@ impl App {
             }
             Mode::Actions(ui) => self.actions_key(ui, key, term),
             Mode::Side(mut sv) => {
+                if self.sb_active() && self.sb_focus {
+                    self.sidebar_key(sv, key, term)?;
+                    return Ok(false);
+                }
                 match sv.on_key(key) {
-                    Outcome::Stay => self.mode = Mode::Side(sv),
+                    Outcome::Stay => match sv.take_request() {
+                        None => self.mode = Mode::Side(sv),
+                        Some(r) => self.side_request(sv, r, term)?,
+                    },
                     Outcome::Close { saved } => {
+                        self.side_rel = None;
+                        self.sb_focus = false;
                         if saved {
                             self.refresh();
                         }
                     }
                 }
+                Ok(false)
+            }
+            Mode::Picker(ui) => {
+                self.picker_key(ui, key, term)?;
                 Ok(false)
             }
             Mode::Filter(mut s) => {
@@ -715,6 +837,7 @@ impl App {
         let half = (self.view_h / 2).max(1) as isize;
         let page = self.view_h.max(1) as isize;
         match key.code {
+            KeyCode::Char('p') if ctrl => self.open_picker(None),
             KeyCode::Char('d') if ctrl => self.scroll_lines(half),
             KeyCode::Char('u') if ctrl => self.scroll_lines(-half),
             KeyCode::Char('f') if ctrl => self.scroll_lines(page),
@@ -834,6 +957,223 @@ impl App {
             _ => {}
         }
         true
+    }
+
+    // ── file picker, file switching, sidebar ──
+
+    /// The sidebar is shown only when the terminal is wide enough.
+    fn sb_active(&self) -> bool {
+        self.sidebar && self.term_w >= 80
+    }
+
+    fn files(&self) -> Vec<FileEntry> {
+        let mut v = Vec::new();
+        collect_files(&self.tree.children, &mut v);
+        v
+    }
+
+    fn open_picker(&mut self, back: Option<Box<SideView>>) {
+        let items = self.files();
+        if items.is_empty() {
+            self.msg = "no files to pick from".to_string();
+            if let Some(sv) = back {
+                self.mode = Mode::Side(sv);
+            }
+            return;
+        }
+        let mut ui = PickerUi { query: String::new(), sel: 0, top: 0, changed_only: false, items, shown: Vec::new(), back };
+        ui.refilter();
+        self.mode = Mode::Picker(Box::new(ui));
+    }
+
+    fn picker_key(&mut self, mut ui: Box<PickerUi>, key: KeyEvent, term: &mut dyn Host) -> io::Result<()> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let n = ui.shown.len();
+        match key.code {
+            KeyCode::Esc => return self.close_picker(ui),
+            KeyCode::Char('c') | KeyCode::Char('g') if ctrl => return self.close_picker(ui),
+            KeyCode::Enter => {
+                let Some((i, _)) = ui.shown.get(ui.sel) else {
+                    self.mode = Mode::Picker(ui);
+                    return Ok(());
+                };
+                let entry = ui.items[*i].clone();
+                return match ui.back.take() {
+                    Some(sv) => self.switch_file(sv, &entry, term),
+                    None => self.open_entry(&entry, term),
+                };
+            }
+            KeyCode::Up => ui.sel = ui.sel.saturating_sub(1),
+            KeyCode::Down => ui.sel = (ui.sel + 1).min(n.saturating_sub(1)),
+            KeyCode::Char('p' | 'k') if ctrl => ui.sel = ui.sel.saturating_sub(1),
+            KeyCode::Char('n' | 'j') if ctrl => ui.sel = (ui.sel + 1).min(n.saturating_sub(1)),
+            KeyCode::PageUp => ui.sel = ui.sel.saturating_sub(10),
+            KeyCode::PageDown => ui.sel = (ui.sel + 10).min(n.saturating_sub(1)),
+            KeyCode::Home => ui.sel = 0,
+            KeyCode::End => ui.sel = n.saturating_sub(1),
+            KeyCode::Tab => {
+                ui.changed_only = !ui.changed_only;
+                ui.refilter();
+            }
+            KeyCode::Backspace => {
+                ui.query.pop();
+                ui.refilter();
+            }
+            KeyCode::Char('u') if ctrl => {
+                ui.query.clear();
+                ui.refilter();
+            }
+            KeyCode::Char('w') if ctrl => {
+                let t = ui.query.trim_end().len();
+                let cut = ui.query[..t].rfind(|c: char| c == '/' || c == ' ').map_or(0, |p| p + 1);
+                ui.query.truncate(cut);
+                ui.refilter();
+            }
+            KeyCode::Char(c) if !ctrl => {
+                ui.query.push(c);
+                ui.refilter();
+            }
+            _ => {}
+        }
+        self.mode = Mode::Picker(ui);
+        Ok(())
+    }
+
+    fn close_picker(&mut self, ui: Box<PickerUi>) -> io::Result<()> {
+        self.mode = match ui.back {
+            Some(sv) => Mode::Side(sv),
+            None => Mode::Normal,
+        };
+        Ok(())
+    }
+
+    /// Show `e` in the list (expanding its parents) and open it.
+    fn open_entry(&mut self, e: &FileEntry, term: &mut dyn Host) -> io::Result<()> {
+        let mut p = e.rel.parent();
+        while let Some(d) = p {
+            if d.as_os_str().is_empty() {
+                break;
+            }
+            self.expanded.insert(d.to_path_buf());
+            p = d.parent();
+        }
+        self.rebuild_rows();
+        if let Some(i) = self.rows.iter().position(|r| r.rel == e.rel) {
+            self.cursor = i;
+        }
+        self.open_row(e.to_row(), term)
+    }
+
+    /// Replace the editor `sv` with another file, unless it has unsaved edits.
+    fn switch_file(&mut self, mut sv: Box<SideView>, e: &FileEntry, term: &mut dyn Host) -> io::Result<()> {
+        if sv.has_unsaved() {
+            sv.note("unsaved changes: save (w) or discard them before switching files");
+            self.mode = Mode::Side(sv);
+            return Ok(());
+        }
+        if sv.saved() {
+            self.refresh();
+        }
+        self.open_entry(e, term)
+    }
+
+    /// `]f` / `[f`: the next / previous file that differs.
+    fn step_changed(&mut self, mut sv: Box<SideView>, forward: bool, term: &mut dyn Host) -> io::Result<()> {
+        let files = self.files();
+        let cur = self.side_rel.as_ref().and_then(|r| files.iter().position(|f| &f.rel == r));
+        let differs = |f: &FileEntry| f.status != Status::Same;
+        let found = match (cur, forward) {
+            (Some(i), true) => files.iter().skip(i + 1).find(|f| differs(f)),
+            (Some(i), false) => files.iter().take(i).rev().find(|f| differs(f)),
+            (None, true) => files.iter().find(|f| differs(f)),
+            (None, false) => files.iter().rev().find(|f| differs(f)),
+        };
+        match found {
+            Some(e) => {
+                let e = e.clone();
+                self.switch_file(sv, &e, term)
+            }
+            None => {
+                sv.note(if forward { "no more changed files" } else { "no earlier changed files" });
+                self.mode = Mode::Side(sv);
+                Ok(())
+            }
+        }
+    }
+
+    fn side_request(&mut self, mut sv: Box<SideView>, r: Request, term: &mut dyn Host) -> io::Result<()> {
+        match r {
+            Request::NextFile => self.step_changed(sv, true, term),
+            Request::PrevFile => self.step_changed(sv, false, term),
+            Request::Picker => {
+                self.open_picker(Some(sv));
+                Ok(())
+            }
+            Request::ToggleSidebar => {
+                self.sidebar = !self.sidebar;
+                self.sb_focus = false;
+                if self.sidebar && self.term_w < 80 {
+                    sv.note("sidebar needs a terminal at least 80 columns wide");
+                } else {
+                    sv.note(if self.sidebar { "sidebar on (T to focus)" } else { "sidebar off" });
+                }
+                self.mode = Mode::Side(sv);
+                Ok(())
+            }
+            Request::FocusSidebar => {
+                self.sidebar = true;
+                self.sb_focus = self.term_w >= 80;
+                if !self.sb_focus {
+                    sv.note("sidebar needs a terminal at least 80 columns wide");
+                }
+                self.mode = Mode::Side(sv);
+                Ok(())
+            }
+        }
+    }
+
+    /// Keys while the sidebar has the keyboard.
+    fn sidebar_key(&mut self, sv: Box<SideView>, key: KeyEvent, term: &mut dyn Host) -> io::Result<()> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let page = (self.view_h / 2).max(1) as isize;
+        let mut sv = Some(sv);
+        match key.code {
+            KeyCode::Esc | KeyCode::Tab | KeyCode::Char('q') => self.sb_focus = false,
+            KeyCode::Char('t') => {
+                self.sidebar = false;
+                self.sb_focus = false;
+            }
+            KeyCode::Char('p') if ctrl => {
+                self.open_picker(sv.take());
+                return Ok(());
+            }
+            KeyCode::Char('d') if ctrl => self.mv(page),
+            KeyCode::Char('u') if ctrl => self.mv(-page),
+            KeyCode::Char('j') | KeyCode::Down => self.mv(1),
+            KeyCode::Char('k') | KeyCode::Up => self.mv(-1),
+            KeyCode::Home | KeyCode::Char('g') => self.cursor = 0,
+            KeyCode::End | KeyCode::Char('G') => self.cursor = self.rows.len().saturating_sub(1),
+            KeyCode::Char('h') | KeyCode::Left => self.collapse_or_parent(),
+            KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter | KeyCode::Char(' ') => {
+                if let Some(row) = self.rows.get(self.cursor).cloned() {
+                    if row.is_dir {
+                        if !self.expanded.remove(&row.rel) {
+                            self.expanded.insert(row.rel.clone());
+                        }
+                        self.rebuild_rows();
+                    } else {
+                        let e = FileEntry::from_row(&row);
+                        let s = sv.take().unwrap();
+                        return self.switch_file(s, &e, term);
+                    }
+                }
+            }
+            _ => {}
+        }
+        if let Some(s) = sv {
+            self.mode = Mode::Side(s);
+        }
+        Ok(())
     }
 
     // ── smooth scrolling ──
@@ -994,6 +1334,11 @@ impl App {
         let Some(row) = self.rows.get(self.cursor).cloned() else {
             return Ok(());
         };
+        self.open_row(row, term)
+    }
+
+    fn open_row(&mut self, row: Row, term: &mut dyn Host) -> io::Result<()> {
+        self.side_rel = None;
         if row.is_dir {
             self.toggle_dir(&row.rel);
             return Ok(());
@@ -1017,6 +1362,7 @@ impl App {
                 v.set_syntax(self.syntax);
                 v.set_chunk_bg(self.chunk_bg);
                 v.set_smooth(self.smooth);
+                self.side_rel = Some(row.rel.clone());
                 self.mode = Mode::Side(Box::new(v));
             }
             Err(fd) => self.mode = Mode::Diff(DiffView::new(&row.rel, fd)),
@@ -1668,10 +2014,44 @@ impl App {
             .constraints([Constraint::Min(3), Constraint::Length(1)])
             .split(area);
         self.view_h = (chunks[0].height.saturating_sub(2) as usize).max(1);
+        self.term_w = area.width;
         self.adjust_top();
 
+        // The editor, with the file sidebar on its left when there is room.
+        let in_editor = matches!(self.mode, Mode::Side(_))
+            || matches!(&self.mode, Mode::Picker(p) if p.back.is_some());
+        let (sb_rect, main) = if in_editor && self.sb_active() {
+            let w = (chunks[0].width / 4).clamp(22, 36);
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Length(w), Constraint::Min(10)])
+                .split(chunks[0]);
+            (Some(cols[0]), cols[1])
+        } else {
+            (None, chunks[0])
+        };
+        if let Some(r) = sb_rect {
+            self.sb_top = sidebar_top(self.sb_top, self.cursor, r.height.saturating_sub(2) as usize);
+            draw_sidebar(
+                f,
+                r,
+                &self.rows,
+                self.cursor,
+                self.sb_top,
+                self.side_rel.as_ref(),
+                self.sb_focus,
+                self.nerd_font,
+            );
+        }
+
         if let Mode::Side(sv) = &mut self.mode {
-            sv.draw(f, chunks[0]);
+            sv.draw(f, main);
+        } else if let Mode::Picker(ui) = &mut self.mode {
+            if let Some(sv) = ui.back.as_mut() {
+                sv.draw(f, main);
+            } else {
+                draw_panels(f, chunks[0], self);
+            }
         } else if let Mode::Diff(dv) = &self.mode {
             draw_diff(f, chunks[0], dv);
         } else {
@@ -1694,6 +2074,7 @@ impl App {
                 draw_ignores(f, area, ui, &self.ignore_all.lines(), &self.pair_lines, &self.msg)
             }
             Mode::Prefs(ui) => draw_prefs(f, area, ui, self),
+            Mode::Picker(ui) => draw_picker(f, area, ui),
             Mode::Keys(ui) => draw_keys(f, area, ui, &self.keymap),
             Mode::Actions(ui) => draw_actions(f, area, ui, &self.keymap),
             Mode::Help => {
@@ -1722,7 +2103,15 @@ impl App {
             .constraints([Constraint::Min(0), Constraint::Length(info.chars().count() as u16)])
             .split(area);
         let (text, style) = match &self.mode {
+            Mode::Side(sv) if self.sb_active() && self.sb_focus => (
+                " sidebar: j/k move  l/Enter open  h fold  Tab/Esc back to editor  t hide  ^p find file".to_string(),
+                Style::default().add_modifier(Modifier::REVERSED),
+            ),
             Mode::Side(sv) => (sv.status(), Style::default().add_modifier(Modifier::REVERSED)),
+            Mode::Picker(_) => (
+                " type to filter  ^n/^p or arrows move  Enter open  Tab changed only  Esc close".to_string(),
+                Style::default().add_modifier(Modifier::REVERSED),
+            ),
             Mode::Filter(s) => (format!("/{s}█"), Style::default().add_modifier(Modifier::REVERSED)),
             Mode::Ignores(_) => (
                 " j/k select  a add  d delete  q close".to_string(),
@@ -1793,6 +2182,7 @@ const HELP: &str = "\
   e               $VISUAL / $EDITOR  s    cycle sort: name/size/date/status
   m  M            pair / unpair dirs S    swap panels
   r               refresh            ?    this help         q  quit
+  ^p              find file (fuzzy picker; Tab: changed only)
   .               actions menu       ,    preferences       K  key bindings
 
  Colors: yellow modified, green only on this side, red missing here, dim identical
@@ -1896,6 +2286,139 @@ fn draw_keys(f: &mut Frame, area: Rect, ui: &KeysUi, km: &Keymap) {
     let r = centered(area, 68, lines.len() as u16 + 2);
     f.render_widget(Clear, r);
     f.render_widget(Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title)), r);
+}
+
+fn status_style(status: Status, present: bool) -> Style {
+    match (present, status) {
+        (false, _) => Style::default().fg(Color::Red).add_modifier(Modifier::DIM),
+        (true, Status::Same) => Style::default().add_modifier(Modifier::DIM),
+        (true, Status::Modified) => Style::default().fg(Color::Yellow),
+        (true, _) => Style::default().fg(Color::Green),
+    }
+}
+
+fn sidebar_top(top: usize, cursor: usize, h: usize) -> usize {
+    let h = h.max(1);
+    if cursor < top {
+        cursor
+    } else if cursor >= top + h {
+        cursor + 1 - h
+    } else {
+        top
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_sidebar(
+    f: &mut Frame,
+    area: Rect,
+    rows: &[Row],
+    cursor: usize,
+    top: usize,
+    current: Option<&PathBuf>,
+    focused: bool,
+    nerd: bool,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" files ")
+        .border_style(Style::default().fg(if focused { Color::Green } else { Color::DarkGray }));
+    let inner = block.inner(area);
+    let w = inner.width as usize;
+    let end = (top + inner.height as usize).min(rows.len());
+    let mut lines: Vec<Line> = Vec::new();
+    for (idx, row) in rows.iter().enumerate().take(end).skip(top) {
+        let is_cur = current.map_or(false, |c| c == &row.rel);
+        let icon = match (row.is_dir, row.expanded, nerd) {
+            (true, true, false) => "▾ ",
+            (true, false, false) => "▸ ",
+            (true, true, true) => "\u{f07c} ",
+            (true, false, true) => "\u{f07b} ",
+            (false, _, true) => "\u{f15b} ",
+            (false, _, false) => if is_cur { "▶ " } else { "  " },
+        };
+        let mut name = format!("{}{}{}", "  ".repeat(row.depth.min(8)), icon, row.name);
+        if row.is_dir {
+            name.push('/');
+        }
+        let text = format!("{:<w$}", fit(&name, w), w = w);
+        let mut style = status_style(row.status, true);
+        if is_cur {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        if focused && idx == cursor {
+            style = style.add_modifier(Modifier::REVERSED);
+        } else if !focused && idx == cursor {
+            style = style.add_modifier(Modifier::UNDERLINED);
+        }
+        lines.push(Line::from(Span::styled(text, style)));
+    }
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_picker(f: &mut Frame, area: Rect, ui: &PickerUi) {
+    let w = area.width.saturating_sub(4).min(96);
+    let h_list = (area.height.saturating_sub(6) as usize).clamp(3, 22);
+    let h = (h_list as u16 + 3).min(area.height);
+    let r = centered(area, w, h);
+    let inner_w = r.width.saturating_sub(2) as usize;
+    let start = window_start(ui.sel, h_list);
+    let mut lines: Vec<Line> = Vec::new();
+    let tag = if ui.changed_only { "  [changed only]" } else { "" };
+    lines.push(Line::from(vec![
+        Span::styled("> ", Style::default().fg(Color::Cyan)),
+        Span::raw(format!("{}█", ui.query)),
+        Span::styled(tag.to_string(), Style::default().fg(Color::Yellow)),
+    ]));
+    if ui.shown.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  no matching files".to_string(),
+            Style::default().add_modifier(Modifier::DIM),
+        )));
+    }
+    for (pos, (i, matched)) in ui.shown.iter().enumerate().skip(start).take(h_list) {
+        let it = &ui.items[*i];
+        let sel = pos == ui.sel;
+        let (mark, col) = match it.status {
+            Status::Modified => ('~', Color::Yellow),
+            Status::LeftOnly => ('-', Color::Red),
+            Status::RightOnly => ('+', Color::Green),
+            Status::Same => (' ', Color::Reset),
+        };
+        let label: Vec<char> = it.label().chars().collect();
+        // keep the end of long paths visible: that is where the file name is
+        let skip = label.len().saturating_sub(inner_w.saturating_sub(4));
+        let base = if sel { Style::default().add_modifier(Modifier::REVERSED) } else { Style::default() };
+        let mut spans = vec![Span::styled(
+            format!(" {mark} "),
+            if col == Color::Reset { base } else { base.fg(col) },
+        )];
+        let mut run = String::new();
+        let mut run_m = false;
+        for (ci, ch) in label.iter().enumerate().skip(skip) {
+            let m = matched.binary_search(&ci).is_ok();
+            if m != run_m && !run.is_empty() {
+                spans.push(Span::styled(std::mem::take(&mut run), picker_text(base, run_m)));
+            }
+            run_m = m;
+            run.push(*ch);
+        }
+        if !run.is_empty() {
+            spans.push(Span::styled(run, picker_text(base, run_m)));
+        }
+        lines.push(Line::from(spans));
+    }
+    let title = format!(" Find file  {}/{} ", ui.shown.len(), ui.items.len());
+    f.render_widget(Clear, r);
+    f.render_widget(Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title)), r);
+}
+
+fn picker_text(base: Style, matched: bool) -> Style {
+    if matched {
+        base.fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    } else {
+        base
+    }
 }
 
 fn draw_actions(f: &mut Frame, area: Rect, ui: &ActionsUi, km: &Keymap) {
@@ -3054,11 +3577,11 @@ mod tests {
     #[test]
     fn ctrl_bindings_and_named_keys() {
         let (root, _) = basic();
-        let km = keymap_of(&[("move_down", &["ctrl+n"]), ("move_up", &["ctrl+p", "ctrl+k"])]);
+        let km = keymap_of(&[("move_down", &["ctrl+n"]), ("move_up", &["ctrl+o", "ctrl+k"])]);
         let mut app = build_with(&root, None, km, false);
         assert!(!ctrl(&mut app, 'n'));
         assert_eq!(app.cursor, 1);
-        ctrl(&mut app, 'p');
+        ctrl(&mut app, 'o');
         assert_eq!(app.cursor, 0);
         keys(&mut app, "j");
         assert_eq!(app.cursor, 0);
@@ -3425,5 +3948,264 @@ mod tests {
         keys(&mut app, "<");
         assert!(matches!(app.mode, Mode::Confirm(_)));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    // ── picker, file switching, sidebar ──
+
+    fn project() -> (PathBuf, App) {
+        let root = tmp();
+        let (l, r) = (root.join("l"), root.join("r"));
+        put(l.join("docs/readme.md"), "a\n");
+        put(r.join("docs/readme.md"), "b\n");
+        put(l.join("gone/old.txt"), "old\n");
+        put(l.join("src/util/deep.rs"), "same\n");
+        put(r.join("src/util/deep.rs"), "same\n");
+        put(l.join("src/main.rs"), "fn main() {}\n");
+        put(r.join("src/main.rs"), "fn main() { x }\n");
+        put(l.join("src/side.rs"), "1\n");
+        put(r.join("src/side.rs"), "2\n");
+        put(l.join("z.txt"), "z\n");
+        put(r.join("z.txt"), "z\n");
+        let app = build(&root, None);
+        (root, app)
+    }
+
+    fn open_file(app: &mut App, name: &str) {
+        select(app, name);
+        code(app, KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::Side(_)), "{name} opens in the editor");
+    }
+
+    fn typed_picker(app: &mut App, text: &str) {
+        for c in text.chars() {
+            code(app, KeyCode::Char(c));
+        }
+    }
+
+    fn picker(app: &App) -> &PickerUi {
+        match &app.mode {
+            Mode::Picker(p) => p,
+            _ => panic!("expected the picker"),
+        }
+    }
+
+    fn shown_labels(app: &App) -> Vec<String> {
+        let p = picker(app);
+        p.shown.iter().map(|(i, _)| p.items[*i].label()).collect()
+    }
+
+    #[test]
+    fn collects_every_file_even_in_collapsed_directories() {
+        let (root, app) = project();
+        let labels: Vec<String> = app.files().iter().map(|f| f.label()).collect();
+        assert_eq!(
+            labels,
+            ["docs/readme.md", "gone/old.txt", "src/util/deep.rs", "src/main.rs", "src/side.rs", "z.txt"]
+        );
+        assert!(!names(&app).contains(&"old.txt".to_string()), "gone/ is collapsed in the list");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn picker_filters_ranks_and_opens_files() {
+        let (root, mut app) = project();
+        ctrl(&mut app, 'p');
+        assert_eq!(picker(&app).items.len(), 6);
+        assert_eq!(picker(&app).shown.len(), 6, "empty query shows everything in tree order");
+        typed_picker(&mut app, "side");
+        assert_eq!(shown_labels(&app)[0], "src/side.rs");
+        assert!(picker(&app).shown[0].1.len() == 4, "matched positions are kept for highlighting");
+        // editing the query
+        code(&mut app, KeyCode::Backspace);
+        code(&mut app, KeyCode::Backspace);
+        code(&mut app, KeyCode::Backspace);
+        code(&mut app, KeyCode::Backspace);
+        assert_eq!(picker(&app).query, "");
+        typed_picker(&mut app, "zzz");
+        assert!(picker(&app).shown.is_empty());
+        code(&mut app, KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::Picker(_)), "Enter with no match does nothing");
+        ctrl(&mut app, 'u');
+        assert_eq!(picker(&app).query, "");
+        typed_picker(&mut app, "src/ma");
+        ctrl(&mut app, 'w');
+        assert_eq!(picker(&app).query, "src/");
+        // changed only drops the identical files
+        code(&mut app, KeyCode::Tab);
+        assert!(!shown_labels(&app).contains(&"src/util/deep.rs".to_string()));
+        assert!(shown_labels(&app).contains(&"src/main.rs".to_string()));
+        code(&mut app, KeyCode::Tab);
+        assert!(shown_labels(&app).contains(&"src/util/deep.rs".to_string()));
+        // moving the selection, then opening
+        ctrl(&mut app, 'u');
+        code(&mut app, KeyCode::Down);
+        code(&mut app, KeyCode::Down);
+        assert_eq!(picker(&app).sel, 2);
+        ctrl(&mut app, 'p');
+        assert_eq!(picker(&app).sel, 1);
+        code(&mut app, KeyCode::Up);
+        code(&mut app, KeyCode::Up);
+        assert_eq!(picker(&app).sel, 0, "stops at the top");
+        ctrl(&mut app, 'u');
+        typed_picker(&mut app, "old");
+        code(&mut app, KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::Side(_)));
+        assert_eq!(app.side_rel, Some(PathBuf::from("gone/old.txt")));
+        assert!(app.expanded.contains(Path::new("gone")), "the list reveals the file");
+        assert_eq!(app.rows[app.cursor].name, "old.txt");
+        keys(&mut app, "q");
+        // Esc closes it without opening anything
+        ctrl(&mut app, 'p');
+        code(&mut app, KeyCode::Esc);
+        assert!(matches!(app.mode, Mode::Normal));
+        // Ctrl-C quits, as in the other popups (only an editor underneath protects it)
+        ctrl(&mut app, 'p');
+        assert!(ctrl(&mut app, 'c'));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn picker_inside_the_editor_returns_or_switches() {
+        let (root, mut app) = project();
+        open_file(&mut app, "main.rs");
+        assert_eq!(app.side_rel, Some(PathBuf::from("src/main.rs")));
+        ctrl(&mut app, 'p');
+        assert!(picker(&app).back.is_some());
+        assert!(!ctrl(&mut app, 'c'), "Ctrl-C must not quit with an editor underneath");
+        assert!(matches!(app.mode, Mode::Side(_)), "back in the editor");
+        // switch
+        ctrl(&mut app, 'p');
+        typed_picker(&mut app, "readme");
+        code(&mut app, KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::Side(_)));
+        assert_eq!(app.side_rel, Some(PathBuf::from("docs/readme.md")));
+        // with unsaved edits the switch is refused and the edits stay
+        keys(&mut app, ">");
+        let Mode::Side(sv) = &app.mode else { panic!() };
+        assert!(sv.has_unsaved());
+        ctrl(&mut app, 'p');
+        typed_picker(&mut app, "side");
+        code(&mut app, KeyCode::Enter);
+        let Mode::Side(sv) = &app.mode else { panic!("still in the editor") };
+        assert!(sv.has_unsaved(), "edits were not thrown away");
+        assert!(sv.status().contains("unsaved"), "{}", sv.status());
+        assert_eq!(app.side_rel, Some(PathBuf::from("docs/readme.md")));
+        // save, then switching works and the list is refreshed
+        keys(&mut app, "w");
+        ctrl(&mut app, 'p');
+        typed_picker(&mut app, "side");
+        code(&mut app, KeyCode::Enter);
+        assert_eq!(app.side_rel, Some(PathBuf::from("src/side.rs")));
+        let readme = app.files().into_iter().find(|f| f.name == "readme.md").unwrap();
+        assert_eq!(readme.status, Status::Same, "saved: the tree was refreshed");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn next_and_previous_changed_file() {
+        let (root, mut app) = project();
+        open_file(&mut app, "main.rs");
+        keys(&mut app, "]f");
+        assert_eq!(app.side_rel, Some(PathBuf::from("src/side.rs")));
+        keys(&mut app, "]f");
+        let Mode::Side(sv) = &app.mode else { panic!() };
+        assert!(sv.status().contains("no more changed files"), "{}", sv.status());
+        assert_eq!(app.side_rel, Some(PathBuf::from("src/side.rs")), "z.txt is identical, so we stay");
+        keys(&mut app, "[f");
+        assert_eq!(app.side_rel, Some(PathBuf::from("src/main.rs")));
+        keys(&mut app, "[f");
+        assert_eq!(app.side_rel, Some(PathBuf::from("gone/old.txt")), "skips the identical deep.rs");
+        keys(&mut app, "[f");
+        assert_eq!(app.side_rel, Some(PathBuf::from("docs/readme.md")));
+        keys(&mut app, "[f");
+        let Mode::Side(sv) = &app.mode else { panic!() };
+        assert!(sv.status().contains("no earlier"), "{}", sv.status());
+        // closing forgets the file
+        keys(&mut app, "q");
+        assert!(matches!(app.mode, Mode::Normal) && app.side_rel.is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sidebar_shows_the_tree_and_switches_files() {
+        let (root, mut app) = project();
+        open_file(&mut app, "main.rs");
+        assert!(!app.sidebar);
+        keys(&mut app, "t");
+        assert!(app.sidebar && !app.sb_focus && app.sb_active());
+        keys(&mut app, "T");
+        assert!(app.sb_focus);
+        // keys now go to the sidebar: j moves in the list, the editor does not scroll
+        let start = app.cursor;
+        keys(&mut app, "j");
+        assert_eq!(app.cursor, start + 1);
+        // Enter on a file opens it
+        select(&mut app, "side.rs");
+        code(&mut app, KeyCode::Enter);
+        assert_eq!(app.side_rel, Some(PathBuf::from("src/side.rs")));
+        assert!(app.sb_focus, "focus stays in the sidebar for the next file");
+        // on a directory it folds / unfolds
+        select(&mut app, "docs");
+        let before = app.rows.len();
+        code(&mut app, KeyCode::Enter);
+        assert!(app.rows.len() < before, "docs collapsed");
+        keys(&mut app, "l");
+        assert_eq!(app.rows.len(), before, "and expanded again");
+        keys(&mut app, "h");
+        assert!(app.rows.len() < before, "h collapses");
+        keys(&mut app, "l");
+        // g / G
+        keys(&mut app, "G");
+        assert_eq!(app.cursor, app.rows.len() - 1);
+        keys(&mut app, "g");
+        assert_eq!(app.cursor, 0);
+        // the picker works from the sidebar and returns to it
+        ctrl(&mut app, 'p');
+        assert!(picker(&app).back.is_some());
+        code(&mut app, KeyCode::Esc);
+        assert!(matches!(app.mode, Mode::Side(_)) && app.sb_focus);
+        // Esc hands the keyboard back to the editor
+        code(&mut app, KeyCode::Esc);
+        assert!(!app.sb_focus && app.sidebar && matches!(app.mode, Mode::Side(_)));
+        keys(&mut app, "j");
+        assert_eq!(app.side_rel, Some(PathBuf::from("src/side.rs")), "j scrolls the editor now");
+        // T focuses again, t inside the sidebar hides it
+        keys(&mut app, "T");
+        assert!(app.sb_focus);
+        keys(&mut app, "t");
+        assert!(!app.sidebar && !app.sb_focus);
+        keys(&mut app, "t");
+        assert!(app.sidebar);
+        // closing the editor drops the focus; the sidebar setting stays for the next file
+        keys(&mut app, "T");
+        code(&mut app, KeyCode::Esc);
+        keys(&mut app, "q");
+        assert!(matches!(app.mode, Mode::Normal) && !app.sb_focus && app.sidebar);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sidebar_needs_a_wide_terminal() {
+        let (root, mut app) = project();
+        app.term_w = 60;
+        open_file(&mut app, "main.rs");
+        keys(&mut app, "t");
+        assert!(app.sidebar && !app.sb_active());
+        let Mode::Side(sv) = &app.mode else { panic!() };
+        assert!(sv.status().contains("80 columns"), "{}", sv.status());
+        keys(&mut app, "T");
+        assert!(!app.sb_focus, "no hidden keyboard focus when nothing is drawn");
+        keys(&mut app, "j");
+        assert_eq!(app.side_rel, Some(PathBuf::from("src/main.rs")));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sidebar_scrolls_to_keep_the_cursor_visible() {
+        assert_eq!(sidebar_top(0, 3, 10), 0);
+        assert_eq!(sidebar_top(0, 10, 10), 1);
+        assert_eq!(sidebar_top(5, 2, 10), 2);
+        assert_eq!(sidebar_top(5, 8, 10), 5);
+        assert_eq!(sidebar_top(0, 0, 0), 0);
     }
 }

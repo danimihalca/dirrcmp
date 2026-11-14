@@ -1,6 +1,7 @@
 mod cli;
 mod config;
 mod engine;
+mod fuzzy;
 mod git;
 mod highlight;
 mod keys;
@@ -8,6 +9,8 @@ mod side;
 mod smooth;
 #[cfg(feature = "syntect")]
 mod syn_syntect;
+#[cfg(test)]
+mod utmp;
 mod undo;
 mod tui;
 

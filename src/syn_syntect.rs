@@ -54,6 +54,14 @@ fn classify(stack: &ScopeStack) -> Kind {
         if has("constant") {
             return Kind::Const;
         }
+        // `fn`, `class`, `let`, ... are scoped storage.type.* but are keywords
+        if ["function", "class", "struct", "enum", "trait", "impl", "namespace", "interface",
+            "type", "let", "const", "var", "def", "module", "import", "use", "mod"]
+            .iter()
+            .any(|k| has(&format!("storage.type.{k}")))
+        {
+            return Kind::Keyword;
+        }
         if has("storage.type") || has("entity.name.type") || has("entity.name.class")
             || has("entity.name.struct") || has("entity.name.enum") || has("entity.name.namespace")
             || has("entity.name.tag") || has("support.type") || has("support.class")

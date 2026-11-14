@@ -1,4 +1,4 @@
-//! Preferences from `config.json` (same file and keys as the original dirrcmp).
+//! Preferences from `config.json` (same file and keys as the original dircmp).
 //!
 //! Location: `$XDG_CONFIG_HOME/dirrcmp/config.json`, else `~/.config/dirrcmp/config.json`,
 //! else `%APPDATA%\dirrcmp\config.json` on Windows. Std only: a small JSON reader
@@ -542,7 +542,7 @@ mod tests {
 
     #[test]
     fn file_loading() {
-        let dir = std::env::temp_dir().join(format!("dirrcmp-cfg-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("dirrcmp-cfg-{}-{}", std::process::id(), crate::utmp::next()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         // missing: defaults, no warning
@@ -591,7 +591,7 @@ mod save_tests {
 
     #[test]
     fn save_creates_directories() {
-        let dir = std::env::temp_dir().join(format!("dirrcmp-cfg-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("dirrcmp-cfg-{}-{}", std::process::id(), crate::utmp::next()));
         let _ = fs::remove_dir_all(&dir);
         let p = dir.join("a/b/config.json");
         save_to(&p, &Config::default()).unwrap();

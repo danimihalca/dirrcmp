@@ -874,7 +874,7 @@ pub fn highlight_file(
     first_line: Option<&str>,
     lines: &[String],
 ) -> Option<(String, Vec<Vec<Kind>>)> {
-    #[cfg(feature = "syntect")]
+    #[cfg(all(feature = "syntect", not(test)))]
     {
         if let Some(r) = crate::syn_syntect::highlight(path, first_line, lines) {
             return Some(r);

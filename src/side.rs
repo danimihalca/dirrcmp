@@ -15,6 +15,16 @@ use crate::highlight::{self, Kind};
 use crate::smooth::Scroller;
 use std::time::Instant;
 
+/// Something the editor wants from the surrounding app (it knows nothing about other files).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Request {
+    NextFile,
+    PrevFile,
+    Picker,
+    ToggleSidebar,
+    FocusSidebar,
+}
+
 pub enum Outcome {
     Stay,
     /// `saved` is true when anything was written to disk (the caller should
@@ -70,6 +80,7 @@ pub struct SideView {
     smooth: bool,
     /// (left, right) must not be changed (git snapshots).
     readonly: (bool, bool),
+    request: Option<Request>,
     scroller: Scroller,
     syn: Option<Syn>,
 }
@@ -154,6 +165,7 @@ impl SideView {
             chunk_bg: true,
             smooth: true,
             readonly: (false, false),
+            request: None,
             scroller: Scroller::default(),
             syn: None,
         };
@@ -169,6 +181,25 @@ impl SideView {
     #[cfg(test)]
     pub fn readonly(&self) -> (bool, bool) {
         self.readonly
+    }
+
+    pub fn take_request(&mut self) -> Option<Request> {
+        self.request.take()
+    }
+
+    /// Edits that are not written to disk yet.
+    pub fn has_unsaved(&self) -> bool {
+        self.m.is_dirty(Pane::Left) || self.m.is_dirty(Pane::Right)
+    }
+
+    /// Anything written to disk since this view was opened.
+    pub fn saved(&self) -> bool {
+        self.saved_any
+    }
+
+    /// Show a message in the status line.
+    pub fn note(&mut self, s: &str) {
+        self.msg = s.to_string();
     }
 
     pub fn set_readonly(&mut self, left: bool, right: bool) {
@@ -396,6 +427,8 @@ impl SideView {
                 ('g', KeyCode::Char('g')) => self.goto_pos(0),
                 (']', KeyCode::Char('c')) => self.jump_hunk(true),
                 ('[', KeyCode::Char('c')) => self.jump_hunk(false),
+                (']', KeyCode::Char('f')) => self.request = Some(Request::NextFile),
+                ('[', KeyCode::Char('f')) => self.request = Some(Request::PrevFile),
                 ('d', KeyCode::Char('p')) => self.put_hunk(self.active),
                 ('d', KeyCode::Char('o')) => self.put_hunk(self.active.other()),
                 ('d', KeyCode::Char('d')) => self.delete_line(),
@@ -421,6 +454,7 @@ impl SideView {
             KeyCode::Char('s') if ctrl => {
                 self.save();
             }
+            KeyCode::Char('p') if ctrl => self.request = Some(Request::Picker),
             _ if ctrl => {}
             KeyCode::Char('q') | KeyCode::Esc => {
                 if self.m.is_dirty(Pane::Left) || self.m.is_dirty(Pane::Right) {
@@ -468,6 +502,8 @@ impl SideView {
                 self.after_edit();
                 self.msg = format!("unchanged lines {}", if self.fold { "folded" } else { "shown" });
             }
+            KeyCode::Char('t') => self.request = Some(Request::ToggleSidebar),
+            KeyCode::Char('T') => self.request = Some(Request::FocusSidebar),
             KeyCode::Char('x') => {
                 let on = !self.syntax;
                 self.set_syntax(on);
@@ -841,6 +877,8 @@ const HELP: &str = "\
   h l   scroll sideways, 0 reset    ,  copy line right -> left
   f   fold/unfold unchanged lines   dp put change active -> other
   x   syntax highlighting on/off
+  ]f [f  next / previous changed file   ^p  find file
+  t   show/hide file sidebar        T   focus the sidebar
   B   chunk background colours on/off
                                     do obtain change other -> active
  Edit (active pane)                 e  Enter  edit line (on a gap: add one)

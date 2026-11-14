@@ -61,6 +61,7 @@ the app to change them live; each change is saved. Key bindings: `keybindings.js
 | `m` `M` | pair / unpair a renamed file or directory |
 | `y` | yank path to clipboard (OSC 52) |
 | `e` | open in `$VISUAL` / `$EDITOR` |
+| `^p` | fuzzy file picker (also inside the editor) |
 | `/` `f` | filter by name / cycle status filter |
 | `i` `I` `zi` | ignore entry (saved per pair) / manage patterns / toggle ignoring |
 | `s` `S` | cycle sort (name/size/date/status) / swap panels |
@@ -119,6 +120,24 @@ gaps red. Unchanged stretches can be folded.
 
 Line endings (LF/CRLF) and a missing final newline are preserved when saving. Binary,
 non-UTF-8 and files over 8 MiB fall back to a read-only note.
+
+## File picker and sidebar
+
+`^p` opens a fuzzy file picker (like telescope / snacks): type a few letters of the path, the
+best match is first (word starts, consecutive letters and file-name matches score higher; a
+capital letter makes the query case-sensitive). `^n` / `^p` or the arrows move, `Enter` opens
+the file, `Tab` limits the list to changed files, `^u` / `^w` clear / delete a word, `Esc`
+closes. It searches every file of the comparison, including ones in collapsed directories, and
+the list reveals the file you opened. Rebindable as `find_file`.
+
+Inside the side-by-side editor the picker, `]f` / `[f` (next / previous changed file) and the
+sidebar switch files without going back to the list. A file with unsaved edits is never
+replaced: save (`w`) or undo first.
+
+The sidebar (`t` show / hide, `T` focus) is the same tree as the directory list, with the open
+file marked. In the sidebar: `j k` move, `l` / `Enter` open a file or fold a directory, `h`
+collapse / parent, `g` `G` first / last, `Tab` / `Esc` back to the editor, `t` hide. It needs a
+terminal at least 80 columns wide.
 
 ## Git mode
 
@@ -206,6 +225,7 @@ compiled in the environment this was written in, so treat it as untested.
     src/undo.rs     undo / redo journal for copy and delete (std only)
     src/highlight.rs  syntax highlighting: language table + tokenizer (std only, tested)
     src/syn_syntect.rs  optional syntect backend (feature `syntect`, untested)
+    src/fuzzy.rs    fuzzy matcher for the picker (std only, tested)
     src/side.rs     side-by-side editor view
     src/tui.rs      directory view
     src/main.rs     wiring

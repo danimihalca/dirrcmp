@@ -10,7 +10,7 @@
 
       manifest = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package;
 
-      mkDircmp = pkgs: { features ? [ ] }:
+      mkDirrcmp = pkgs: { features ? [ ] }:
         pkgs.rustPlatform.buildRustPackage {
           pname = manifest.name;
           version = manifest.version;
@@ -40,9 +40,9 @@
     in
     {
       packages = forAll (pkgs: rec {
-        dirrcmp = mkDircmp pkgs { };
+        dirrcmp = mkDirrcmp pkgs { };
         # More languages for syntax highlighting (pulls in the syntect crate).
-        dirrcmp-syntect = mkDircmp pkgs { features = [ "syntect" ]; };
+        dirrcmp-syntect = mkDirrcmp pkgs { features = [ "syntect" ]; };
         default = dirrcmp;
       });
 
@@ -55,7 +55,7 @@
       });
 
       overlays.default = final: _prev: {
-        dirrcmp = mkDircmp final { };
+        dirrcmp = mkDirrcmp final { };
       };
 
       devShells = forAll (pkgs: {
