@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -18,7 +19,8 @@ use crate::engine::{
     self, DiffLine, FileDiff, Ignore, LineKind, Meta, Node, Opts, SortKey, Status,
 };
 use crate::keys::{self, Chord, Key, Keymap, Tr};
-use crate::side::{Outcome, SideView};
+use crate::highlight::{self, Kind};
+use crate::side::{self, Outcome, SideView};
 use crate::undo::{Journal, Recipe};
 
 pub struct Config {
@@ -33,6 +35,8 @@ pub struct Config {
     pub cli_dates: bool,
     pub cli_quick: bool,
     pub cli_diff: Option<String>,
+    /// `--no-syntax`: no highlighting for this run, whatever the preferences say.
+    pub cli_no_syntax: bool,
     pub keymap: Keymap,
     /// Problems found in `keybindings.json`, shown on start.
     pub key_warnings: Vec<String>,
@@ -53,11 +57,12 @@ pub fn run(cfg: Config) -> io::Result<()> {
 
 /// Two plain files: open the side-by-side editor on its own. Returns the
 /// `FileDiff` to print instead when the files can't be edited as text.
-pub fn run_files(left: PathBuf, right: PathBuf) -> io::Result<Option<FileDiff>> {
+pub fn run_files(left: PathBuf, right: PathBuf, syntax: bool) -> io::Result<Option<FileDiff>> {
     let mut view = match SideView::open(left, right, true, true) {
         Ok(v) => v,
         Err(fd) => return Ok(Some(fd)),
     };
+    view.set_syntax(syntax);
     let mut terminal = ratatui::init();
     let res = file_loop(&mut terminal, &mut view);
     ratatui::restore();
@@ -77,13 +82,20 @@ fn file_loop(term: &mut DefaultTerminal, view: &mut SideView) -> io::Result<()> 
                 chunks[1],
             );
         })?;
-        if let Event::Key(k) = event::read()? {
-            if k.kind != KeyEventKind::Press {
-                continue;
+        // Handle everything that is already queued before drawing again. Terminals turn a
+        // mouse-wheel flick into a burst of Up/Down keys; redrawing after each one makes the
+        // view lag behind and keep scrolling after the wheel has stopped or reversed.
+        loop {
+            if let Event::Key(k) = event::read()? {
+                // Ctrl-C is ignored like in the directory view: it must not drop edits.
+                if k.kind == KeyEventKind::Press {
+                    if let Outcome::Close { .. } = view.on_key(k) {
+                        return Ok(());
+                    }
+                }
             }
-            // Ctrl-C is ignored like in the directory view: it must not drop edits.
-            if let Outcome::Close { .. } = view.on_key(k) {
-                return Ok(());
+            if !event::poll(Duration::ZERO)? {
+                break;
             }
         }
     }
@@ -261,6 +273,39 @@ struct DiffView {
     scroll: usize,
     added: usize,
     removed: usize,
+    syntax: Option<UniSyntax>,
+    chunk_bg: bool,
+}
+
+/// Highlighting for both files of a unified diff, indexed by line number.
+struct UniSyntax {
+    left: Vec<Vec<Kind>>,
+    right: Vec<Vec<Kind>>,
+}
+
+impl UniSyntax {
+    fn load(l: Option<&Path>, r: Option<&Path>) -> Option<UniSyntax> {
+        let one = |p: Option<&Path>| -> Vec<Vec<Kind>> {
+            let Some(p) = p else { return Vec::new() };
+            let Ok(t) = engine::load_text(Some(p)) else { return Vec::new() };
+            let first = t.lines.first().map(|s| s.as_str());
+            highlight::highlight_file(p, first, &t.lines).map(|x| x.1).unwrap_or_default()
+        };
+        let (left, right) = (one(l), one(r));
+        if left.is_empty() && right.is_empty() {
+            None
+        } else {
+            Some(UniSyntax { left, right })
+        }
+    }
+
+    fn kinds(&self, l: &DiffLine) -> Option<&[Kind]> {
+        let (v, no) = match l.kind {
+            LineKind::Del => (&self.left, l.left_no),
+            _ => (&self.right, l.right_no.or(l.left_no)),
+        };
+        v.get(no?.checked_sub(1)?).map(|k| k.as_slice())
+    }
 }
 
 impl DiffView {
@@ -274,6 +319,8 @@ impl DiffView {
             scroll: 0,
             added: 0,
             removed: 0,
+            syntax: None,
+            chunk_bg: false,
         };
         match fd {
             FileDiff::Text(d) => {
@@ -285,6 +332,8 @@ impl DiffView {
                     lines: d.lines,
                     note: if empty { Some("(empty file)".to_string()) } else { None },
                     scroll: 0,
+                    syntax: None,
+                    chunk_bg: false,
                 }
             }
             FileDiff::Identical => note_only("Files are identical".to_string()),
@@ -318,7 +367,7 @@ struct PrefsUi {
     editing: Option<String>,
 }
 
-const PREF_ROWS: usize = 6;
+const PREF_ROWS: usize = 8;
 
 struct KeysUi {
     sel: usize,
@@ -364,6 +413,9 @@ struct App {
     cli_dates: bool,
     cli_quick: bool,
     cli_diff: Option<String>,
+    cli_no_syntax: bool,
+    syntax: bool,
+    chunk_bg: bool,
     keymap: Keymap,
     config_file: Option<PathBuf>,
     keys_file: Option<PathBuf>,
@@ -416,9 +468,12 @@ impl App {
             dirs_first: cfg.prefs.dirs_first,
             show_hints: cfg.prefs.show_hints,
             nerd_font: cfg.prefs.nerd_font,
+            syntax: cfg.prefs.syntax && !cfg.cli_no_syntax,
+            chunk_bg: cfg.prefs.chunk_bg,
             prefs: cfg.prefs,
             cli_dates: cfg.cli_dates,
             cli_quick: cfg.cli_quick,
+            cli_no_syntax: cfg.cli_no_syntax,
             cli_diff: cfg.cli_diff,
             keymap: cfg.keymap,
             config_file: cfg.config_file,
@@ -453,9 +508,15 @@ impl App {
     fn event_loop(&mut self, term: &mut DefaultTerminal) -> io::Result<()> {
         loop {
             term.draw(|f| self.draw(f))?;
-            if let Event::Key(k) = event::read()? {
-                if k.kind == KeyEventKind::Press && self.on_key(k, term)? {
-                    return Ok(());
+            // Drain the queue before redrawing (see `file_loop`).
+            loop {
+                if let Event::Key(k) = event::read()? {
+                    if k.kind == KeyEventKind::Press && self.on_key(k, term)? {
+                        return Ok(());
+                    }
+                }
+                if !event::poll(Duration::ZERO)? {
+                    break;
                 }
             }
         }
@@ -852,7 +913,11 @@ impl App {
             row.left.is_some(),
             row.right.is_some(),
         ) {
-            Ok(v) => self.mode = Mode::Side(Box::new(v)),
+            Ok(mut v) => {
+                v.set_syntax(self.syntax);
+                v.set_chunk_bg(self.chunk_bg);
+                self.mode = Mode::Side(Box::new(v));
+            }
             Err(fd) => self.mode = Mode::Diff(DiffView::new(&row.rel, fd)),
         }
         Ok(())
@@ -869,7 +934,12 @@ impl App {
         let lp = row.left.as_ref().map(|_| self.path_of(&row, Side::Left));
         let rp = row.right.as_ref().map(|_| self.path_of(&row, Side::Right));
         let fd = engine::file_diff(lp.as_deref(), rp.as_deref());
-        self.mode = Mode::Diff(DiffView::new(&row.rel, fd));
+        let mut dv = DiffView::new(&row.rel, fd);
+        dv.chunk_bg = self.chunk_bg;
+        if self.syntax {
+            dv.syntax = UniSyntax::load(lp.as_deref(), rp.as_deref());
+        }
+        self.mode = Mode::Diff(dv);
     }
 
     fn open_editor(&mut self, term: &mut dyn Host) -> io::Result<()> {
@@ -1134,6 +1204,11 @@ impl App {
             2 => (format!("{} Directories first", mark(self.prefs.dirs_first)), String::new()),
             3 => (format!("{} Show key hints", mark(self.prefs.show_hints)), String::new()),
             4 => (format!("{} Nerd Font icons", mark(self.prefs.nerd_font)), String::new()),
+            5 => (
+                format!("{} Syntax highlighting", mark(self.prefs.syntax)),
+                if self.cli_no_syntax { "--no-syntax is on this run".into() } else { String::new() },
+            ),
+            6 => (format!("{} Chunk background colours", mark(self.prefs.chunk_bg)), String::new()),
             _ => (
                 format!(
                     "    External diff command: {}",
@@ -1149,6 +1224,8 @@ impl App {
         self.dirs_first = self.prefs.dirs_first;
         self.show_hints = self.prefs.show_hints;
         self.nerd_font = self.prefs.nerd_font;
+        self.syntax = self.prefs.syntax && !self.cli_no_syntax;
+        self.chunk_bg = self.prefs.chunk_bg;
         self.diff_cmd = self.cli_diff.clone().or_else(|| self.prefs.diff_command.clone());
         self.opts.compare_dates = self.cli_dates || self.prefs.compare_dates;
         self.opts.compare_contents = self.prefs.compare_contents && !self.cli_quick;
@@ -1213,13 +1290,15 @@ impl App {
                     2 => self.prefs.dirs_first = !self.prefs.dirs_first,
                     3 => self.prefs.show_hints = !self.prefs.show_hints,
                     4 => self.prefs.nerd_font = !self.prefs.nerd_font,
+                    5 => self.prefs.syntax = !self.prefs.syntax,
+                    6 => self.prefs.chunk_bg = !self.prefs.chunk_bg,
                     _ => {
                         if key.code == KeyCode::Enter {
                             ui.editing = Some(self.prefs.diff_command.clone().unwrap_or_default());
                         }
                     }
                 }
-                if ui.sel < 5 {
+                if ui.sel < 7 {
                     self.prefs_changed(ui.sel);
                 }
             }
@@ -1892,7 +1971,51 @@ fn clean(s: &str) -> String {
     s.replace('\t', "    ")
 }
 
-fn diff_line(l: &DiffLine) -> Line<'static> {
+/// Spans for `text` (tabs expanded) coloured by `kinds`, one span per run.
+fn syntax_spans(text: &str, kinds: &[Kind]) -> Vec<Span<'static>> {
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_k = Kind::Plain;
+    for (i, c) in text.chars().enumerate() {
+        let k = kinds.get(i).copied().unwrap_or(Kind::Plain);
+        if k != cur_k && !cur.is_empty() {
+            out.push(Span::styled(std::mem::take(&mut cur), side::syntax_style(cur_k)));
+        }
+        cur_k = k;
+        if c == '\t' {
+            cur.push_str("    ");
+        } else {
+            cur.push(c);
+        }
+    }
+    if !cur.is_empty() {
+        out.push(Span::styled(cur, side::syntax_style(cur_k)));
+    }
+    out
+}
+
+fn diff_line(l: &DiffLine, syn: Option<&UniSyntax>) -> Line<'static> {
+    if let Some(kinds) = syn.and_then(|s| s.kinds(l)) {
+        let sign = match l.kind {
+            LineKind::Add => Some(("+ ", Style::default().fg(Color::Green))),
+            LineKind::Del => Some(("- ", Style::default().fg(Color::Red))),
+            LineKind::Context => Some(("  ", Style::default())),
+            LineKind::Hunk => None,
+        };
+        if let Some((s, sty)) = sign {
+            let dim = Style::default().add_modifier(Modifier::DIM);
+            let num = |o: Option<usize>| match o {
+                Some(v) => format!("{v:>5}"),
+                None => "     ".to_string(),
+            };
+            let mut spans = vec![
+                Span::styled(format!("{} {} │ ", num(l.left_no), num(l.right_no)), dim),
+                Span::styled(s.to_string(), sty),
+            ];
+            spans.extend(syntax_spans(&l.text, kinds));
+            return Line::from(spans);
+        }
+    }
     let num = |o: Option<usize>| match o {
         Some(v) => format!("{v:>5}"),
         None => "     ".to_string(),
@@ -1917,6 +2040,30 @@ fn diff_line(l: &DiffLine) -> Line<'static> {
     }
 }
 
+/// `diff_line` with a background on added / removed lines, padded to `width`.
+fn tinted_line(l: &DiffLine, syn: Option<&UniSyntax>, width: usize) -> Line<'static> {
+    let line = diff_line(l, syn);
+    let color = match l.kind {
+        LineKind::Add => side::chunk_bg_color(engine::RowKind::LeftOnly, true, false),
+        LineKind::Del => side::chunk_bg_color(engine::RowKind::LeftOnly, false, false),
+        _ => return line,
+    };
+    let bg = Style::default().bg(color);
+    let used: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+    let mut spans: Vec<Span<'static>> = line
+        .spans
+        .into_iter()
+        .map(|s| {
+            let st = s.style.patch(bg);
+            Span::styled(s.content.into_owned(), st)
+        })
+        .collect();
+    if used < width {
+        spans.push(Span::styled(" ".repeat(width - used), bg));
+    }
+    Line::from(spans)
+}
+
 fn draw_diff(f: &mut Frame, area: Rect, dv: &DiffView) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1929,7 +2076,11 @@ fn draw_diff(f: &mut Frame, area: Rect, dv: &DiffView) {
     let start = dv.scroll.min(dv.lines.len());
     let end = (start + inner.height as usize).min(dv.lines.len());
     for l in &dv.lines[start..end] {
-        lines.push(diff_line(l));
+        lines.push(if dv.chunk_bg {
+            tinted_line(l, dv.syntax.as_ref(), inner.width as usize)
+        } else {
+            diff_line(l, dv.syntax.as_ref())
+        });
     }
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
@@ -2007,6 +2158,7 @@ mod tests {
             cli_dates,
             cli_quick: false,
             cli_diff: diff_cmd.map(String::from),
+            cli_no_syntax: false,
             keymap,
             key_warnings: Vec::new(),
             config_file: Some(root.join("cfg/config.json")),
@@ -2124,6 +2276,130 @@ mod tests {
         assert!(app.sort == SortKey::Size);
         keys(&mut app, "S"); // swap panels
         assert!(app.left.ends_with("r") && app.right.ends_with("l"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn text_of(l: &Line) -> String {
+        l.spans.iter().map(|s| s.content.to_string()).collect()
+    }
+
+    #[test]
+    fn unified_view_is_highlighted_from_the_whole_files() {
+        let root = tmp();
+        let (l, r) = (root.join("l"), root.join("r"));
+        put(l.join("m.rs"), "/*\nfn old() {}\n*/\nlet a = \"x\";\n");
+        put(r.join("m.rs"), "/*\nfn old() {}\n*/\n// y\n");
+        put(l.join("n.txt"), "fn a() {}\n");
+        put(r.join("n.txt"), "fn b() {}\n");
+        let mut app = build(&root, None);
+        select(&mut app, "m.rs");
+        keys(&mut app, "D");
+        let Mode::Diff(dv) = &app.mode else { panic!("expected the unified diff") };
+        let syn = dv.syntax.as_ref().expect("highlighted");
+        let del = dv.lines.iter().find(|x| x.kind == LineKind::Del).unwrap();
+        let add = dv.lines.iter().find(|x| x.kind == LineKind::Add).unwrap();
+        let ctx = dv.lines.iter().find(|x| x.kind == LineKind::Context && x.text.contains("fn old")).unwrap();
+        // the string differs, and each side's line is looked up in its own file
+        assert_eq!(syn.kinds(del).unwrap()[8], Kind::Str);
+        assert_eq!(syn.kinds(add).unwrap()[0], Kind::Comment);
+        assert_eq!(syn.kinds(del).unwrap()[0], Kind::Keyword);
+        // context inside a multi-line comment is a comment although the line alone looks like code
+        assert_eq!(syn.kinds(ctx).unwrap()[0], Kind::Comment);
+        let hunk = dv.lines.iter().find(|x| x.kind == LineKind::Hunk).unwrap();
+        assert!(syn.kinds(hunk).is_none() || diff_line(hunk, Some(syn)).spans.len() == 1);
+
+        let line = diff_line(del, Some(syn));
+        assert_eq!(text_of(&line), diff_line(del, None).spans.iter().map(|s| s.content.to_string()).collect::<String>());
+        let kw = line.spans.iter().find(|s| s.content == "let").expect("keyword span");
+        assert_eq!(kw.style.fg, Some(Color::Magenta));
+        assert!(diff_line(add, Some(syn)).spans.iter().any(|s| s.style.fg == Some(Color::DarkGray)));
+        let sign = line.spans.iter().find(|s| s.content == "- ").expect("sign span");
+        assert_eq!(sign.style.fg, Some(Color::Red));
+        let sign = diff_line(add, Some(syn)).spans.iter().find(|s| s.content == "+ ").unwrap().style.fg;
+        assert_eq!(sign, Some(Color::Green));
+        keys(&mut app, "q");
+
+        // a file type without a language is shown as before
+        select(&mut app, "n.txt");
+        keys(&mut app, "D");
+        assert!(matches!(&app.mode, Mode::Diff(dv) if dv.syntax.is_none()));
+        keys(&mut app, "q");
+
+        // switching it off in the preferences
+        app.prefs.syntax = false;
+        app.apply_prefs();
+        select(&mut app, "m.rs");
+        keys(&mut app, "D");
+        assert!(matches!(&app.mode, Mode::Diff(dv) if dv.syntax.is_none()));
+        keys(&mut app, "q");
+        // and --no-syntax wins over the preference
+        app.prefs.syntax = true;
+        app.cli_no_syntax = true;
+        app.apply_prefs();
+        assert!(!app.syntax);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unified_view_tints_added_and_removed_lines() {
+        let (root, mut app) = basic();
+        select(&mut app, "x.txt");
+        keys(&mut app, "D");
+        let Mode::Diff(dv) = &app.mode else { panic!("unified diff") };
+        assert!(dv.chunk_bg);
+        let add = dv.lines.iter().find(|x| x.kind == LineKind::Add).unwrap();
+        let del = dv.lines.iter().find(|x| x.kind == LineKind::Del).unwrap();
+        let ctx = dv.lines.iter().find(|x| x.kind == LineKind::Context);
+        let a = tinted_line(add, None, 40);
+        let d = tinted_line(del, None, 40);
+        let width = |l: &Line| l.spans.iter().map(|s| s.content.chars().count()).sum::<usize>();
+        assert_eq!(width(&a), 40, "padded to the full width");
+        assert!(a.spans.iter().all(|s| s.style.bg == Some(Color::Indexed(22))));
+        assert!(d.spans.iter().all(|s| s.style.bg == Some(Color::Indexed(52))));
+        if let Some(c) = ctx {
+            assert!(tinted_line(c, None, 40).spans.iter().all(|s| s.style.bg.is_none()));
+        }
+        // text is unchanged apart from the padding
+        assert_eq!(text_of(&a).trim_end(), text_of(&diff_line(add, None)).trim_end());
+        keys(&mut app, "q");
+        app.prefs.chunk_bg = false;
+        app.apply_prefs();
+        select(&mut app, "x.txt");
+        keys(&mut app, "D");
+        assert!(matches!(&app.mode, Mode::Diff(dv) if !dv.chunk_bg));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cli_no_syntax_beats_the_preference() {
+        let root = tmp();
+        put(root.join("l/m.rs"), "fn a() {}\n");
+        put(root.join("r/m.rs"), "fn b() {}\n");
+        let mut cfg = cfg_for(&root, None, Keymap::default(), false);
+        cfg.cli_no_syntax = true;
+        assert!(cfg.prefs.syntax);
+        assert!(!App::new(cfg).syntax);
+        assert!(App::new(cfg_for(&root, None, Keymap::default(), false)).syntax);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn side_view_follows_the_syntax_setting() {
+        let root = tmp();
+        put(root.join("l/m.rs"), "fn a() {}\n");
+        put(root.join("r/m.rs"), "fn b() {}\n");
+        let mut app = build(&root, None);
+        select(&mut app, "m.rs");
+        code(&mut app, KeyCode::Enter);
+        let Mode::Side(sv) = &app.mode else { panic!("side view") };
+        assert!(sv.syntax_enabled());
+        keys(&mut app, "q");
+        app.prefs.syntax = false;
+        app.apply_prefs();
+        select(&mut app, "m.rs");
+        code(&mut app, KeyCode::Enter);
+        let Mode::Side(sv) = &app.mode else { panic!("side view") };
+        assert!(!sv.syntax_enabled());
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -2687,6 +2963,16 @@ mod tests {
         assert!(app.nerd_font);
         let saved = config::load_from(&file).0;
         assert!(saved.compare_dates && !saved.dirs_first && !saved.show_hints && saved.nerd_font);
+
+        // syntax highlighting
+        assert!(app.syntax);
+        keys(&mut app, "j ");
+        assert!(!app.syntax && !app.prefs.syntax);
+        assert!(!config::load_from(&file).0.syntax);
+        assert!(app.chunk_bg);
+        keys(&mut app, "j ");
+        assert!(!app.chunk_bg && !app.prefs.chunk_bg);
+        assert!(!config::load_from(&file).0.chunk_bg);
 
         // external diff command: Enter edits, typing, Enter saves
         keys(&mut app, "j");

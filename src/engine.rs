@@ -1192,6 +1192,8 @@ pub struct Merge {
     redo: Vec<Snap>,
     dirty_l: bool,
     dirty_r: bool,
+    /// Bumped on every change to either side; lets callers cache derived data.
+    pub rev: u64,
 }
 
 impl Merge {
@@ -1217,6 +1219,7 @@ impl Merge {
             redo: Vec::new(),
             dirty_l: false,
             dirty_r: false,
+            rev: 0,
         }
     }
 
@@ -1246,6 +1249,7 @@ impl Merge {
     }
 
     fn recompute(&mut self) {
+        self.rev += 1;
         self.align = align(&self.left.lines, &self.right.lines);
         self.dirty_l = self.left.lines != self.orig_l;
         self.dirty_r = self.right.lines != self.orig_r;

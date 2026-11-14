@@ -11,6 +11,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::engine::{self, FileDiff, Merge, Pane, RowKind};
+use crate::highlight::{self, Kind};
 
 pub enum Outcome {
     Stay,
@@ -61,6 +62,46 @@ pub struct SideView {
     view_h: usize,
     text_w: usize,
     saved_any: bool,
+    syntax: bool,
+    /// Tint the whole row of every changed chunk.
+    chunk_bg: bool,
+    syn: Option<Syn>,
+}
+
+/// Syntax kinds for both sides, valid for one `Merge::rev`.
+struct Syn {
+    rev: u64,
+    left: Option<(String, Vec<Vec<Kind>>)>,
+    right: Option<(String, Vec<Vec<Kind>>)>,
+}
+
+/// Background of a changed row: yellowish = modified, green = only here, red = missing here.
+/// `cur` is the brighter shade used for the hunk under the cursor.
+pub fn chunk_bg_color(kind: RowKind, present: bool, cur: bool) -> Color {
+    let (dark, bright) = match (kind, present) {
+        (RowKind::Changed, _) => (58, 94),
+        (_, true) => (22, 28),
+        (_, false) => (52, 88),
+    };
+    Color::Indexed(if cur { bright } else { dark })
+}
+
+/// Style of a syntax token. Plain text keeps the terminal default.
+pub fn syntax_style(k: Kind) -> Style {
+    let s = Style::default();
+    match k {
+        Kind::Plain => s,
+        Kind::Keyword => s.fg(Color::Magenta),
+        Kind::Type => s.fg(Color::Cyan),
+        Kind::Str => s.fg(Color::Green),
+        Kind::Comment => s.fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        Kind::Number => s.fg(Color::Yellow),
+        Kind::Const => s.fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        Kind::Func => s.fg(Color::Blue),
+        Kind::Attr => s.fg(Color::LightMagenta),
+        Kind::Var => s.fg(Color::LightCyan),
+        Kind::Key => s.fg(Color::LightBlue),
+    }
 }
 
 impl SideView {
@@ -96,6 +137,9 @@ impl SideView {
             view_h: 20,
             text_w: 40,
             saved_any: false,
+            syntax: true,
+            chunk_bg: true,
+            syn: None,
         };
         v.rebuild();
         match v.m.align.hunks.first() {
@@ -104,6 +148,56 @@ impl SideView {
         }
         v.fix_cursor();
         v
+    }
+
+    pub fn set_chunk_bg(&mut self, on: bool) {
+        self.chunk_bg = on;
+    }
+
+    /// Turn syntax highlighting on or off (on by default).
+    pub fn set_syntax(&mut self, on: bool) {
+        self.syntax = on;
+        if !on {
+            self.syn = None;
+        }
+    }
+
+    #[cfg(test)]
+    pub fn syntax_enabled(&self) -> bool {
+        self.syntax
+    }
+
+    /// Name of the language highlighted on the active side, if any.
+    pub fn syntax_name(&self) -> Option<&str> {
+        let s = self.syn.as_ref()?;
+        let side = if self.active == Pane::Left { &s.left } else { &s.right };
+        side.as_ref().or(s.left.as_ref()).or(s.right.as_ref()).map(|x| x.0.as_str())
+    }
+
+    /// Recompute the highlighting if the text changed since the last time.
+    fn ensure_syntax(&mut self) {
+        if !self.syntax {
+            return;
+        }
+        if self.syn.as_ref().map_or(false, |s| s.rev == self.m.rev) {
+            return;
+        }
+        let one = |path: &PathBuf, b: &engine::TextBuf| {
+            if !b.exists {
+                return None;
+            }
+            let first = b.lines.first().map(|s| s.as_str());
+            highlight::highlight_file(path, first, &b.lines)
+        };
+        let left = one(&self.lpath, &self.m.left);
+        let right = one(&self.rpath, &self.m.right);
+        self.syn = Some(Syn { rev: self.m.rev, left, right });
+    }
+
+    fn kinds(&self, pane: Pane, line: usize) -> Option<&[Kind]> {
+        let s = self.syn.as_ref()?;
+        let side = if pane == Pane::Left { &s.left } else { &s.right };
+        side.as_ref()?.1.get(line).map(|v| v.as_slice())
     }
 
     // ── layout bookkeeping ──
@@ -301,6 +395,15 @@ impl SideView {
                 self.after_edit();
                 self.msg = format!("unchanged lines {}", if self.fold { "folded" } else { "shown" });
             }
+            KeyCode::Char('x') => {
+                let on = !self.syntax;
+                self.set_syntax(on);
+                self.msg = format!("syntax highlighting {}", if on { "on" } else { "off" });
+            }
+            KeyCode::Char('B') => {
+                self.chunk_bg = !self.chunk_bg;
+                self.msg = format!("chunk background {}", if self.chunk_bg { "on" } else { "off" });
+            }
             KeyCode::Char('?') => self.mode = Mode::Help,
             _ => {}
         }
@@ -486,8 +589,9 @@ impl SideView {
                     Some(h) => format!("change {}/{}", h + 1, n),
                     None => format!("{n} change{}", if n == 1 { "" } else { "s" }),
                 };
+                let lang = self.syntax_name().map(|n| format!("  [{n}]")).unwrap_or_default();
                 format!(
-                    " {info}  >/< copy change  ,/. copy line  e edit  o add  dd delete  u undo  w save  ? help  q close"
+                    " {info}{lang}  >/< copy change  ,/. copy line  e edit  o add  dd delete  u undo  w save  ? help  q close"
                 )
             }
         }
@@ -498,6 +602,7 @@ impl SideView {
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(area);
+        self.ensure_syntax();
         self.view_h = (area.height.saturating_sub(2) as usize).max(1);
         let inner_w = cols[0].width.saturating_sub(2) as usize;
         let nmax = self.m.left.lines.len().max(self.m.right.lines.len());
@@ -597,6 +702,14 @@ impl SideView {
             (_, false) => base = base.fg(Color::Red).add_modifier(Modifier::DIM),
         }
 
+        // Row tint: a brighter shade for the hunk the cursor is in.
+        let tint = if self.chunk_bg && row.kind != RowKind::Equal {
+            let cur = row.hunk.is_some() && row.hunk == cur_hunk;
+            Some(chunk_bg_color(row.kind, idx.is_some(), cur))
+        } else {
+            None
+        };
+        let bg = tint.map_or(Style::default(), |c| Style::default().bg(c));
         let num = match idx {
             Some(k) => format!("{:>w$} ", k + 1, w = gw),
             None => " ".repeat(gw + 1),
@@ -608,7 +721,7 @@ impl SideView {
         } else {
             '│'
         };
-        let mut spans = vec![Span::styled(num, deco(dim)), Span::styled(mark.to_string(), deco(base))];
+        let mut spans = vec![Span::styled(num, deco(dim.patch(bg))), Span::styled(mark.to_string(), deco(base.patch(bg)))];
 
         let editing = match &self.mode {
             Mode::Edit(e) if e.pane == pane && e.row == i => Some(e),
@@ -624,9 +737,12 @@ impl SideView {
                 }
                 _ => None,
             };
-            spans.extend(text_spans(text, hl, base, self.hscroll, tw, &deco));
+            let kinds = self.kinds(pane, k);
+            // With syntax colours the status colour lives in the gutter mark only.
+            let tbase = (if kinds.is_some() { Style::default() } else { base }).patch(bg);
+            spans.extend(text_spans(text, hl, tbase, kinds, self.hscroll, tw, &deco));
         } else {
-            spans.push(Span::styled(" ".repeat(tw), deco(base)));
+            spans.push(Span::styled(" ".repeat(tw), deco(base.patch(bg))));
         }
         Line::from(spans)
     }
@@ -639,6 +755,8 @@ const HELP: &str = "\
   Tab H L   switch active pane      .  copy line left -> right
   h l   scroll sideways, 0 reset    ,  copy line right -> left
   f   fold/unfold unchanged lines   dp put change active -> other
+  x   syntax highlighting on/off
+  B   chunk background colours on/off
                                     do obtain change other -> active
  Edit (active pane)                 e  Enter  edit line (on a gap: add one)
   o   add a line below              dd delete line
@@ -671,47 +789,48 @@ fn text_spans(
     text: &str,
     hl: Option<(usize, usize)>,
     base: Style,
+    kinds: Option<&[Kind]>,
     hscroll: usize,
     tw: usize,
     deco: &dyn Fn(Style) -> Style,
 ) -> Vec<Span<'static>> {
-    let mut cells: Vec<(char, bool)> = Vec::new();
+    let mut cells: Vec<(char, bool, Kind)> = Vec::new();
     for (ci, c) in text.chars().enumerate() {
         let h = hl.map_or(false, |(a, b)| ci >= a && ci < b);
+        let k = kinds.and_then(|k| k.get(ci)).copied().unwrap_or(Kind::Plain);
         if c == '\t' {
             for _ in 0..4 {
-                cells.push((' ', h));
+                cells.push((' ', h, k));
             }
         } else if c.is_control() {
-            cells.push(('·', h));
+            cells.push(('·', h, k));
         } else {
-            cells.push((c, h));
+            cells.push((c, h, k));
         }
     }
-    let mut vis: Vec<(char, bool)> = cells.into_iter().skip(hscroll).take(tw).collect();
+    let mut vis: Vec<(char, bool, Kind)> = cells.into_iter().skip(hscroll).take(tw).collect();
     while vis.len() < tw {
-        vis.push((' ', false));
+        vis.push((' ', false, Kind::Plain));
     }
-    let make = |s: String, h: bool| -> Span<'static> {
-        let st = if h {
-            base.add_modifier(Modifier::BOLD).add_modifier(Modifier::UNDERLINED)
-        } else {
-            base
-        };
+    let make = |s: String, h: bool, k: Kind| -> Span<'static> {
+        let mut st = if kinds.is_some() { base.patch(syntax_style(k)) } else { base };
+        if h {
+            st = st.add_modifier(Modifier::BOLD).add_modifier(Modifier::UNDERLINED);
+        }
         Span::styled(s, deco(st))
     };
     let mut spans = Vec::new();
     let mut cur = String::new();
-    let mut cur_h = false;
-    for (c, h) in vis {
-        if h != cur_h && !cur.is_empty() {
-            spans.push(make(std::mem::take(&mut cur), cur_h));
+    let mut cur_key = (false, Kind::Plain);
+    for (c, h, k) in vis {
+        if (h, k) != cur_key && !cur.is_empty() {
+            spans.push(make(std::mem::take(&mut cur), cur_key.0, cur_key.1));
         }
-        cur_h = h;
+        cur_key = (h, k);
         cur.push(c);
     }
     if !cur.is_empty() {
-        spans.push(make(cur, cur_h));
+        spans.push(make(cur, cur_key.0, cur_key.1));
     }
     spans
 }
@@ -792,6 +911,168 @@ mod tests {
     }
     fn lines(s: &str) -> Vec<String> {
         s.split_whitespace().map(String::from).collect()
+    }
+
+    fn rs_view(a: &str, b: &str) -> (PathBuf, SideView) {
+        let root = tmp();
+        fs::write(root.join("l.rs"), a).unwrap();
+        fs::write(root.join("r.rs"), b).unwrap();
+        let v = SideView::open(root.join("l.rs"), root.join("r.rs"), true, true).ok().unwrap();
+        (root, v)
+    }
+
+    fn kind_at(v: &SideView, pane: Pane, line: usize, ch: usize) -> Kind {
+        v.kinds(pane, line).map(|k| k[ch]).unwrap_or(Kind::Plain)
+    }
+
+    #[test]
+    fn syntax_follows_edits_and_toggle() {
+        let (root, mut v) = rs_view("fn a() {}\nx\n", "/*\nb\n*/\nlet x = 1;\n");
+        v.ensure_syntax();
+        assert_eq!(v.syntax_name(), Some("Rust"));
+        assert_eq!(kind_at(&v, Pane::Left, 0, 0), Kind::Keyword);
+        assert_eq!(kind_at(&v, Pane::Right, 1, 0), Kind::Comment, "inside a block comment");
+        let rev = v.syn.as_ref().unwrap().rev;
+        assert_eq!(rev, v.m.rev);
+
+        // delete the comment opener on the right (active) pane: the next line is code again
+        v.cursor = 0;
+        typed(&mut v, "dd");
+        assert_ne!(v.m.rev, rev, "an edit bumps the revision");
+        v.ensure_syntax();
+        assert_eq!(v.syn.as_ref().unwrap().rev, v.m.rev);
+        assert_eq!(kind_at(&v, Pane::Right, 0, 0), Kind::Plain, "b is no longer a comment");
+        // undo brings the colouring back
+        typed(&mut v, "u");
+        v.ensure_syntax();
+        assert_eq!(kind_at(&v, Pane::Right, 1, 0), Kind::Comment);
+
+        // x switches it off and on
+        typed(&mut v, "x");
+        assert!(!v.syntax && v.syn.is_none() && v.kinds(Pane::Left, 0).is_none());
+        assert_eq!(v.msg, "syntax highlighting off");
+        v.ensure_syntax();
+        assert!(v.syn.is_none(), "off stays off");
+        typed(&mut v, "x");
+        v.ensure_syntax();
+        assert!(v.syntax && v.syn.is_some());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rendered_rows_keep_the_status_colour_in_the_gutter_only() {
+        let (root, mut v) = rs_view("let a = 1;\n", "let a = 2;\n");
+        let fg_of = |l: &Line, text: &str| l.spans.iter().find(|s| s.content.contains(text)).map(|s| s.style.fg);
+        // syntax on: gutter mark yellow (changed), code coloured by kind, plain text uncoloured
+        v.ensure_syntax();
+        let line = v.render_line(Disp::Row(0), Pane::Right, 3, None);
+        assert_eq!(fg_of(&line, "│"), Some(Some(Color::Yellow)));
+        assert_eq!(fg_of(&line, "let"), Some(Some(Color::Magenta)));
+        assert_eq!(fg_of(&line, "a"), Some(None));
+        // syntax off: the whole line is yellow as before
+        v.set_syntax(false);
+        let line = v.render_line(Disp::Row(0), Pane::Right, 3, None);
+        assert!(line.spans.iter().any(|s| s.content.contains("let a =") && s.style.fg == Some(Color::Yellow)));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn chunk_background_tints_changed_rows_and_toggles() {
+        let (root, mut v) = view("a\nb\nc\n", "a\nX\nc\nd\n");
+        v.set_syntax(false);
+        let bg_of = |v: &SideView, pane: Pane, row: usize, cur: Option<usize>| -> Vec<Option<Color>> {
+            v.render_line(Disp::Row(row), pane, 3, cur).spans.iter().skip(1).map(|s| s.style.bg).collect()
+        };
+        // equal row: no tint at all
+        assert!(bg_of(&v, Pane::Left, 0, None).iter().all(|b| b.is_none()));
+        // changed row: both sides tinted, mark and text alike
+        let ch = bg_of(&v, Pane::Left, 1, None);
+        assert!(ch.len() >= 2 && ch.iter().all(|b| *b == Some(Color::Indexed(58))), "{ch:?}");
+        // the hunk under the cursor is brighter
+        let cur = bg_of(&v, Pane::Right, 1, v.m.align.rows[1].hunk);
+        assert!(cur.iter().all(|b| *b == Some(Color::Indexed(94))), "{cur:?}");
+        // a line that exists on one side only: green where it is, red on the gap
+        let last = v.m.align.rows.len() - 1;
+        assert!(bg_of(&v, Pane::Right, last, None).iter().all(|b| *b == Some(Color::Indexed(22))));
+        let gap = bg_of(&v, Pane::Left, last, None);
+        assert!(gap.len() >= 2 && gap.iter().all(|b| *b == Some(Color::Indexed(52))), "{gap:?}");
+        // B switches it off and on
+        typed(&mut v, "B");
+        assert!(!v.chunk_bg);
+        assert_eq!(v.msg, "chunk background off");
+        assert!(bg_of(&v, Pane::Left, 1, None).iter().all(|b| b.is_none()));
+        typed(&mut v, "B");
+        assert!(v.chunk_bg);
+        v.set_chunk_bg(false);
+        assert!(bg_of(&v, Pane::Left, 1, None).iter().all(|b| b.is_none()));
+        // with syntax colours the tint stays under the code colours
+        let (root2, mut v2) = rs_view("let a = 1;\n", "let a = 2;\n");
+        v2.ensure_syntax();
+        let l = v2.render_line(Disp::Row(0), Pane::Left, 3, None);
+        let kw = l.spans.iter().find(|s| s.content == "let").unwrap();
+        assert_eq!((kw.style.fg, kw.style.bg), (Some(Color::Magenta), Some(Color::Indexed(58))));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&root2);
+    }
+
+    #[test]
+    fn status_names_the_language() {
+        let (root, mut v) = rs_view("fn a() {}\n", "fn b() {}\n");
+        v.ensure_syntax();
+        assert!(v.status().contains("[Rust]"), "{}", v.status());
+        v.set_syntax(false);
+        assert!(!v.status().contains("[Rust]"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unknown_languages_and_missing_sides_are_left_plain() {
+        let (root, mut v) = view("fn a() {}\n", "fn b() {}\n"); // no extension
+        v.ensure_syntax();
+        assert!(v.syn.as_ref().unwrap().left.is_none());
+        assert_eq!(v.syntax_name(), None);
+        assert!(v.kinds(Pane::Left, 0).is_none());
+        let root2 = tmp();
+        fs::write(root2.join("l.rs"), "fn a() {}\n").unwrap();
+        let mut v = SideView::open(root2.join("l.rs"), root2.join("new.rs"), true, false).ok().unwrap();
+        v.ensure_syntax();
+        assert!(v.syn.as_ref().unwrap().right.is_none(), "a side that does not exist");
+        assert_eq!(v.syntax_name(), Some("Rust"), "falls back to the other side's language");
+        v.set_syntax(false);
+        assert_eq!(v.syntax_name(), None);
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&root2);
+    }
+
+    #[test]
+    fn text_spans_use_syntax_colours_instead_of_the_status_colour() {
+        let id = |s: Style| s;
+        let base = Style::default().fg(Color::Yellow);
+        let kinds = [Kind::Keyword, Kind::Keyword, Kind::Keyword, Kind::Plain, Kind::Str, Kind::Str];
+        let sp = text_spans("let \"", None, Style::default(), Some(&kinds), 0, 8, &id);
+        assert_eq!(sp[0].content, "let");
+        assert_eq!(sp[0].style.fg, Some(Color::Magenta));
+        assert_eq!(sp[1].content, " ");
+        assert_eq!(sp[1].style.fg, None, "plain text keeps the terminal colour");
+        assert_eq!(sp[2].content, "\"");
+        assert_eq!(sp[2].style.fg, Some(Color::Green));
+        let total: usize = sp.iter().map(|s| s.content.chars().count()).sum();
+        assert_eq!(total, 8, "padded to the pane width");
+        // without syntax the whole line takes the status colour, as before
+        let sp = text_spans("let x", None, base, None, 0, 5, &id);
+        assert_eq!(sp.len(), 1);
+        assert_eq!(sp[0].style.fg, Some(Color::Yellow));
+        // the changed-part marker is added on top of the syntax colour
+        let sp = text_spans("let", Some((1, 3)), Style::default(), Some(&kinds[..3]), 0, 3, &id);
+        assert_eq!(sp.len(), 2);
+        assert_eq!(sp[0].style.fg, Some(Color::Magenta));
+        assert_eq!(sp[1].style.fg, Some(Color::Magenta));
+        assert_ne!(sp[0].style, sp[1].style);
+        // tabs expand to four cells that keep their kind, and sideways scrolling cuts cells
+        let k2 = [Kind::Plain, Kind::Comment];
+        let sp = text_spans("\t#", None, Style::default(), Some(&k2), 3, 2, &id);
+        assert_eq!(sp.iter().map(|s| s.content.to_string()).collect::<String>(), " #");
+        assert_eq!(sp[sp.len() - 1].style.fg, Some(Color::DarkGray));
     }
 
     #[test]

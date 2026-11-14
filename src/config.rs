@@ -21,6 +21,10 @@ pub struct Config {
     pub show_hints: bool,
     /// `nerdFont`: use Nerd Font icons instead of ASCII markers.
     pub nerd_font: bool,
+    /// `syntaxHighlight`: colour code in the diff views.
+    pub syntax: bool,
+    /// `chunkBackground`: tint the rows of changed chunks.
+    pub chunk_bg: bool,
     /// `diffCommand`: external diff for Enter on a file, e.g. `nvim -d`.
     pub diff_command: Option<String>,
 }
@@ -33,6 +37,8 @@ impl Default for Config {
             dirs_first: true,
             show_hints: true,
             nerd_font: false,
+            syntax: true,
+            chunk_bg: true,
             diff_command: None,
         }
     }
@@ -292,6 +298,8 @@ pub fn parse(text: &str) -> Result<Config, String> {
                 "dirsFirst" => cfg.dirs_first = want_bool(val)?,
                 "showHints" => cfg.show_hints = want_bool(val)?,
                 "nerdFont" => cfg.nerd_font = want_bool(val)?,
+                "syntaxHighlight" => cfg.syntax = want_bool(val)?,
+                "chunkBackground" => cfg.chunk_bg = want_bool(val)?,
                 "diffCommand" => match val {
                     Val::Str(s) => cfg.diff_command = if s.trim().is_empty() { None } else { Some(s) },
                     Val::Other => cfg.diff_command = None, // null
@@ -347,6 +355,8 @@ pub fn to_json(c: &Config) -> String {
     s.push_str(&format!("  \"dirsFirst\": {},\n", c.dirs_first));
     s.push_str(&format!("  \"showHints\": {},\n", c.show_hints));
     s.push_str(&format!("  \"nerdFont\": {},\n", c.nerd_font));
+    s.push_str(&format!("  \"syntaxHighlight\": {},\n", c.syntax));
+    s.push_str(&format!("  \"chunkBackground\": {},\n", c.chunk_bg));
     match &c.diff_command {
         Some(d) => s.push_str(&format!("  \"diffCommand\": {}\n", json_str(d))),
         None => s.push_str("  \"diffCommand\": null\n"),
@@ -449,6 +459,7 @@ mod tests {
         let d = Config::default();
         assert!(d.compare_contents && d.dirs_first && d.show_hints);
         assert!(!d.compare_dates && !d.nerd_font && d.diff_command.is_none());
+        assert!(d.syntax && d.chunk_bg);
         assert_eq!(parse("").unwrap(), d);
         assert_eq!(parse("  \n").unwrap(), d);
         assert_eq!(parse("{}").unwrap(), d);
@@ -560,6 +571,11 @@ mod save_tests {
         c.diff_command = Some("nvim -d \"x\"\\y".to_string());
         let back = parse(&to_json(&c)).unwrap();
         assert!(back.compare_dates && back.nerd_font && !back.dirs_first && back.compare_contents);
+        assert!(back.syntax);
+        c.syntax = false;
+        assert!(!parse(&to_json(&c)).unwrap().syntax);
+        c.chunk_bg = false;
+        assert!(!parse(&to_json(&c)).unwrap().chunk_bg);
         assert_eq!(back.diff_command.as_deref(), Some("nvim -d \"x\"\\y"));
         let d = parse(&to_json(&Config::default())).unwrap();
         assert_eq!(d.diff_command, None);

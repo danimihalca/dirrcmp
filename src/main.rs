@@ -1,8 +1,11 @@
 mod cli;
 mod config;
 mod engine;
+mod highlight;
 mod keys;
 mod side;
+#[cfg(feature = "syntect")]
+mod syn_syntect;
 mod undo;
 mod tui;
 
@@ -45,7 +48,8 @@ fn run() -> i32 {
     // diff like `diff -u` (exit 1 if different).
     if left.is_file() && right.is_file() {
         if matches!(c.cmd, Command::Tui) && std::io::stdout().is_terminal() {
-            match tui::run_files(left.clone(), right.clone()) {
+            let syntax = config::load().0.syntax && !c.no_syntax;
+            match tui::run_files(left.clone(), right.clone(), syntax) {
                 Ok(None) => return 0,
                 Ok(Some(fd)) => {
                     print!("{}", cli::render_file_diff(&fd, &left, &right));
@@ -108,6 +112,7 @@ fn run() -> i32 {
                 cli_dates: c.compare_dates,
                 cli_quick: c.quick,
                 cli_diff: c.diff_cmd,
+                cli_no_syntax: c.no_syntax,
                 keymap,
                 key_warnings,
                 config_file: config::config_path(),

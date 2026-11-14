@@ -17,7 +17,7 @@ Single binary, Linux / macOS / Windows, no VCS needed.
     dircmp diff  LEFT RIGHT            print differences (--format tree|flat|json, --filter, --stat)
     dircmp check LEFT RIGHT            silent, exit 0 if identical / 1 if different (CI)
 
-    --no-ignore  --ignore PATTERN (repeatable)  --follow-symlinks  --dates  --quick
+    --no-ignore  --ignore PATTERN (repeatable)  --follow-symlinks  --dates  --quick  --no-syntax
     --diff-cmd "nvim -d"   (or env DIRCMP_DIFF)  external diff for Enter in the TUI
 
 Ignored by default: `.git`, `node_modules`, `.DS_Store`. More patterns come from
@@ -27,7 +27,7 @@ applied by `diff` and `check`). Syntax is gitignore-like: `*`, `?`, `**`, a lead
 `/` anchors to the root, a trailing `/` matches directories only, `!` negates.
 
 Preferences: `$XDG_CONFIG_HOME/dircmp/config.json` (default `~/.config/dircmp/config.json`) with
-`compareDates`, `compareContents`, `dirsFirst`, `showHints`, `nerdFont`, `diffCommand`. Press `,` in
+`compareDates`, `compareContents`, `dirsFirst`, `showHints`, `nerdFont`, `syntaxHighlight`, `chunkBackground`, `diffCommand`. Press `,` in
 the app to change them live; each change is saved. Key bindings: `keybindings.json` next to it
 (see below), or press `K`.
 
@@ -101,10 +101,48 @@ gaps red. Unchanged stretches can be folded.
 | `u` `^r` | undo / redo |
 | `w` `^s` | save the changed sides (a side that does not exist yet is created) |
 | `Tab` `H` `L`, `f`, `h l`, `0` | switch pane / fold unchanged / scroll sideways / reset |
+| `x` | syntax highlighting on / off for this view |
+| `B` | background tint of changed rows on / off for this view |
 | `q` `Esc` | close (asks about unsaved edits) |
 
 Line endings (LF/CRLF) and a missing final newline are preserved when saving. Binary,
 non-UTF-8 and files over 8 MiB fall back to a read-only note.
+
+## Chunk background
+
+Changed rows get a background tint across the whole row, in both the side-by-side editor and
+the unified view: yellowish = modified, green = only on this side, red = missing on this side
+(the gap), and a brighter shade for the change under the cursor. It uses 256-colour palette
+entries, so it works in any modern terminal. Toggle with `B` (one view) or `,` → *Chunk
+background colours* (saved as `chunkBackground`); on by default.
+
+## Syntax highlighting
+
+Both the side-by-side editor and the unified `D` view are highlighted. The file is tokenized
+from the top, so multi-line comments and strings are right even when only a few lines are on
+screen, and the colours follow edits and undo. In the side-by-side view the change colour
+(yellow / green / red) moves to the gutter bar so it does not fight with the code colours; the
+changed part of a modified line is still bold and underlined. The status bar shows the language.
+Switch it off with `x` (one view), `,` → *Syntax highlighting* (saved), or `--no-syntax` (one run).
+
+The built-in highlighter needs no dependency. It is a small table-driven tokenizer, not a
+parser: keywords, types, strings (incl. raw / triple-quoted / multi-line), comments (nested where
+the language nests them), numbers, constants, calls, attributes / preprocessor / decorators,
+shell and make variables, and keys. Languages: Rust, C, C++, C#, Java, Kotlin, Go, JavaScript,
+TypeScript, Python, Ruby, Lua, shell, Makefile, BitBake, Dockerfile, CMake, SQL, JSON, TOML,
+INI / `.conf` / `.service`, Kconfig, YAML, Nix, Devicetree (`.dts`, `.overlay`), CSS / SCSS,
+HTML / XML, Markdown. A language is picked from the file name or extension, or a `#!` line.
+Files over about 3 MB and lines over 4000 characters are left plain.
+
+For more languages build with the optional [syntect](https://crates.io/crates/syntect) crate
+(Sublime syntax definitions, pure-Rust regex engine; adds compile time and a few MB):
+
+    cargo build --release --features syntect
+
+syntect is tried first and the built-in highlighter takes anything syntect does not know
+(TOML, TypeScript, Kconfig, BitBake, Devicetree...). Only syntect's parser is used, its scopes
+are mapped onto the same colours. That feature module (`src/syn_syntect.rs`) could not be
+compiled in the environment this was written in, so treat it as untested.
 
 ## Differences from the original
 
@@ -128,6 +166,8 @@ non-UTF-8 and files over 8 MiB fall back to a read-only note.
     src/config.rs   config.json / keybindings.json reader and writer (std only)
     src/keys.rs     key chords, action table, user key bindings (std only)
     src/undo.rs     undo / redo journal for copy and delete (std only)
+    src/highlight.rs  syntax highlighting: language table + tokenizer (std only, tested)
+    src/syn_syntect.rs  optional syntect backend (feature `syntect`, untested)
     src/side.rs     side-by-side editor view
     src/tui.rs      directory view
     src/main.rs     wiring

@@ -19,6 +19,7 @@ USAGE:
 
 OPTIONS:
         --no-ignore           disable all ignore patterns
+        --no-syntax           no syntax highlighting in the diff views
         --ignore <PATTERN>    add a gitignore-style pattern (repeatable)
         --follow-symlinks     follow symlinks instead of comparing link targets
         --dates               also treat differing modification times as a difference
@@ -39,7 +40,7 @@ saved per pair of directories in the pairs/ folder next to it and also apply
 to 'diff' and 'check'.
 Preferences live in $XDG_CONFIG_HOME/dircmp/config.json (default
 ~/.config/dircmp/config.json): compareDates, compareContents, dirsFirst,
-showHints, nerdFont, diffCommand.
+showHints, nerdFont, syntaxHighlight, chunkBackground, diffCommand.
 ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +65,7 @@ pub struct Cli {
     pub left: Option<PathBuf>,
     pub right: Option<PathBuf>,
     pub no_ignore: bool,
+    pub no_syntax: bool,
     pub ignore: Vec<String>,
     pub follow_symlinks: bool,
     pub compare_dates: bool,
@@ -103,6 +105,7 @@ pub fn parse_args(args: Vec<String>) -> Result<Cli, String> {
     let mut help = false;
     let mut version = false;
     let mut no_ignore = false;
+    let mut no_syntax = false;
     let mut ignore = Vec::new();
     let mut follow_symlinks = false;
     let mut compare_dates = false;
@@ -129,6 +132,7 @@ pub fn parse_args(args: Vec<String>) -> Result<Cli, String> {
             "-h" | "--help" => help = true,
             "-v" | "--version" => version = true,
             "--no-ignore" => no_ignore = true,
+            "--no-syntax" => no_syntax = true,
             "--follow-symlinks" => follow_symlinks = true,
             "--dates" => compare_dates = true,
             "--quick" => quick = true,
@@ -173,7 +177,7 @@ pub fn parse_args(args: Vec<String>) -> Result<Cli, String> {
         }
     };
 
-    Ok(Cli { cmd, left, right, no_ignore, ignore, follow_symlinks, compare_dates, quick, diff_cmd })
+    Ok(Cli { cmd, left, right, no_ignore, no_syntax, ignore, follow_symlinks, compare_dates, quick, diff_cmd })
 }
 
 // ───────────────────────────── ignore loading ─────────────────────────────
@@ -451,7 +455,8 @@ mod tests {
 
         let c = parse_args(args("check --no-ignore --dates --quick x y")).unwrap();
         assert!(matches!(c.cmd, Command::Check { stat: false }));
-        assert!(c.no_ignore && c.compare_dates && c.quick);
+        assert!(c.no_ignore && c.compare_dates && c.quick && !c.no_syntax);
+        assert!(parse_args(args("--no-syntax a b")).unwrap().no_syntax);
 
         let c = parse_args(args("--follow-symlinks --diff-cmd=nvim a b")).unwrap();
         assert!(matches!(c.cmd, Command::Tui));
