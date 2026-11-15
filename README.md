@@ -165,6 +165,15 @@ single hunk / line (`>` / `.` in the side-by-side editor). Only the `git` comman
 library. Untracked files show up as right-only. Submodule contents and LFS data are not
 compared (LFS files compare as their pointer files).
 
+## Mouse
+
+Wheel scrolls everywhere (3 lines per notch, eased like the keys). Left click in the directory
+view selects a row and focuses that panel; clicking a directory selects it (click it again, or click its arrow, to fold/unfold), double-clicking
+a file opens it. In the file picker a click opens the entry; in the editor a click on the sidebar
+opens that file or folds that directory, and a click in a pane puts the cursor on that line.
+While the mouse is captured, hold Shift (Option on macOS terminals) to select text with the
+terminal. Turn it off with `,` → *Mouse support* (`"mouse": false`).
+
 ## Renamed and moved files
 
 Files that exist on one side only are matched with one-sided files on the other side, like
@@ -174,6 +183,11 @@ file lives on the right; the left panel shows the old path. `diff`/`check` print
 `R old -> new (87%)`, `--format json` gives `"status":"renamed","from":...,"similarity":...`,
 `--stat` adds `N renamed`. Each file is used once; a matching base name or directory wins ties.
 
+- **Cyan** rows moved with identical content, **magenta** rows moved *and* changed (the status bar
+  shows the similarity). `f` cycles through `renamed/moved`, `moved, unchanged` and `moved, changed`;
+  on the command line use `--filter renamed`, `moved` or `renamed-modified`. Renames are not listed
+  under `modified`.
+- Folds you close stay closed while a filter is active (and filters keep the folds you opened).
 - `Enter` opens the pair in the side-by-side editor; `>` / `<` copy the content over the other path.
 - `R` renames the file on the focused side to the other side's path (undo with `u`).
 - Off with `,` → *Detect renamed / moved files* (`detectRenames`) or `--no-renames` (one run).

@@ -35,7 +35,8 @@ OPTIONS:
 
 OPTIONS (diff / check):
         --format <FMT>        tree (default), flat or json          [diff]
-        --filter <KIND>       modified, left-only or right-only (repeatable, or comma list)
+        --filter <KIND>       modified, left-only, right-only, renamed, moved (renamed, same content),
+                              renamed-modified (renamed and changed); repeatable or comma list
         --stat                print a summary line (to stdout; before the result for check)
 
 Ignored by default: .git, node_modules, .DS_Store.
@@ -58,7 +59,7 @@ pub enum Format {
 #[derive(Debug)]
 pub enum Command {
     Tui,
-    Diff { format: Format, filter: Vec<Status>, stat: bool },
+    Diff { format: Format, filter: Vec<Want>, stat: bool },
     Check { stat: bool },
     Help,
     Version,
@@ -92,13 +93,32 @@ fn take_value(
     }
 }
 
-fn parse_filter(v: &str, out: &mut Vec<Status>) -> Result<(), String> {
+/// One kind of entry a `--filter` asks for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Want {
+    S(Status),
+    /// Any detected rename/move.
+    Renamed,
+    /// Renamed/moved with identical content.
+    Moved,
+    /// Renamed/moved and changed.
+    Edited,
+}
+
+fn parse_filter(v: &str, out: &mut Vec<Want>) -> Result<(), String> {
     for part in v.split(',') {
         out.push(match part.trim() {
-            "modified" => Status::Modified,
-            "left-only" => Status::LeftOnly,
-            "right-only" => Status::RightOnly,
-            other => return Err(format!("unknown filter '{other}' (modified, left-only, right-only)")),
+            "modified" => Want::S(Status::Modified),
+            "left-only" => Want::S(Status::LeftOnly),
+            "right-only" => Want::S(Status::RightOnly),
+            "renamed" => Want::Renamed,
+            "moved" => Want::Moved,
+            "renamed-modified" | "moved-modified" => Want::Edited,
+            other => {
+                return Err(format!(
+                    "unknown filter '{other}' (modified, left-only, right-only, renamed, moved, renamed-modified)"
+                ))
+            }
         });
     }
     Ok(())
@@ -108,7 +128,7 @@ pub fn parse_args(args: Vec<String>) -> Result<Cli, String> {
     let mut sub: Option<String> = None;
     let mut pos: Vec<String> = Vec::new();
     let mut format = Format::Tree;
-    let mut filter: Vec<Status> = Vec::new();
+    let mut filter: Vec<Want> = Vec::new();
     let mut stat = false;
     let mut help = false;
     let mut version = false;
@@ -331,8 +351,23 @@ fn status_name(s: Status) -> &'static str {
     }
 }
 
-fn wanted(s: Status, filter: &[Status]) -> bool {
-    s != Status::Same && (filter.is_empty() || filter.contains(&s))
+fn wanted(n: &Node, filter: &[Want]) -> bool {
+    if n.status == Status::Same {
+        return false;
+    }
+    if filter.is_empty() {
+        return true;
+    }
+    match n.rename {
+        // a detected rename is not reported as "modified"; ask for renamed/moved
+        Some(p) => filter.iter().any(|w| match w {
+            Want::Renamed => true,
+            Want::Moved => p >= 100,
+            Want::Edited => p < 100,
+            Want::S(_) => false,
+        }),
+        None => filter.contains(&Want::S(n.status)),
+    }
 }
 
 /// A directory present on both sides whose contents differ: we recurse into it
@@ -347,12 +382,12 @@ fn is_container(n: &Node) -> bool {
 /// for a detected rename (then `path` is the new path).
 pub type Entry = (String, Status, bool, Option<(String, u8)>);
 
-pub fn collect_entries(root: &Node, filter: &[Status]) -> Vec<Entry> {
-    fn rec(n: &Node, filter: &[Status], out: &mut Vec<Entry>) {
+pub fn collect_entries(root: &Node, filter: &[Want]) -> Vec<Entry> {
+    fn rec(n: &Node, filter: &[Want], out: &mut Vec<Entry>) {
         for c in &n.children {
             if is_container(c) {
                 rec(c, filter, out);
-            } else if wanted(c.status, filter) {
+            } else if wanted(c, filter) {
                 match c.rename {
                     Some(p) => out.push((
                         engine::rel_string(&c.rrel),
@@ -370,17 +405,17 @@ pub fn collect_entries(root: &Node, filter: &[Status]) -> Vec<Entry> {
     out
 }
 
-fn has_match(n: &Node, filter: &[Status]) -> bool {
+fn has_match(n: &Node, filter: &[Want]) -> bool {
     n.children.iter().any(|c| {
         if is_container(c) {
             has_match(c, filter)
         } else {
-            wanted(c.status, filter)
+            wanted(c, filter)
         }
     })
 }
 
-pub fn render_flat(root: &Node, filter: &[Status]) -> String {
+pub fn render_flat(root: &Node, filter: &[Want]) -> String {
     let mut s = String::new();
     for (p, st, is_dir, rn) in collect_entries(root, filter) {
         match rn {
@@ -395,8 +430,8 @@ pub fn render_flat(root: &Node, filter: &[Status]) -> String {
     s
 }
 
-pub fn render_tree(root: &Node, filter: &[Status]) -> String {
-    fn rec(n: &Node, depth: usize, filter: &[Status], out: &mut String) {
+pub fn render_tree(root: &Node, filter: &[Want]) -> String {
+    fn rec(n: &Node, depth: usize, filter: &[Want], out: &mut String) {
         let indent = "  ".repeat(depth);
         for c in &n.children {
             if is_container(c) {
@@ -404,7 +439,7 @@ pub fn render_tree(root: &Node, filter: &[Status]) -> String {
                     let _ = writeln!(out, "  {indent}{}/", c.name);
                     rec(c, depth + 1, filter, out);
                 }
-            } else if wanted(c.status, filter) {
+            } else if wanted(c, filter) {
                 if let Some(pct) = c.rename {
                     let _ = writeln!(out, "R {indent}{}", rename_text(c, pct));
                     continue;
@@ -442,7 +477,7 @@ fn json_escape(s: &str) -> String {
     o
 }
 
-pub fn render_json(root: &Node, filter: &[Status]) -> String {
+pub fn render_json(root: &Node, filter: &[Want]) -> String {
     let entries = collect_entries(root, filter);
     let mut s = String::from("[");
     for (i, (p, st, is_dir, rn)) in entries.iter().enumerate() {
@@ -533,7 +568,7 @@ mod tests {
         match c.cmd {
             Command::Diff { format, filter, stat } => {
                 assert_eq!(format, Format::Json);
-                assert_eq!(filter, vec![Status::Modified, Status::LeftOnly]);
+                assert_eq!(filter, vec![Want::S(Status::Modified), Want::S(Status::LeftOnly)]);
                 assert!(stat);
             }
             _ => panic!(),
@@ -582,6 +617,12 @@ mod tests {
         (root, t)
     }
 
+    fn t_on(l: &Path, r: &Path) -> Node {
+        let mut t = compare(l, r, &Opts { detect_renames: true, ..Opts::default() });
+        sort_tree(&mut t, SortKey::Name, true);
+        t
+    }
+
     #[test]
     fn renames_in_the_outputs() {
         let (root, _) = sample();
@@ -614,6 +655,12 @@ mod tests {
         assert!(render_flat(&t, &[]).contains("- m/\n"));
         assert!(!render_stat(&t).contains("renamed"));
         assert!(parse_args(args("--no-renames a b")).unwrap().no_renames);
+        // renamed / moved (same content) / renamed-modified
+        let flat = |w: &[Want]| render_flat(&t_on(&l, &r), w);
+        assert_eq!(flat(&[Want::Moved]), "R m/old.txt -> n/new.txt\n");
+        assert!(flat(&[Want::Edited]).starts_with("R q/f.rs -> q/g.rs ("));
+        assert_eq!(flat(&[Want::Renamed]).lines().count(), 2);
+        assert!(!flat(&[Want::S(Status::Modified)]).contains("->"), "renames are not 'modified'");
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -621,15 +668,15 @@ mod tests {
     fn renders() {
         let (root, t) = sample();
         assert_eq!(render_flat(&t, &[]), "~ a/x.txt\n- gone/\n+ new \"q\".txt\n");
-        assert_eq!(render_flat(&t, &[Status::RightOnly]), "+ new \"q\".txt\n");
+        assert_eq!(render_flat(&t, &[Want::S(Status::RightOnly)]), "+ new \"q\".txt\n");
         assert_eq!(
             render_tree(&t, &[]),
             "  a/\n~   x.txt\n- gone/\n+ new \"q\".txt\n"
         );
-        assert_eq!(render_tree(&t, &[Status::LeftOnly]), "- gone/\n");
-        let j = render_json(&t, &[Status::Modified]);
+        assert_eq!(render_tree(&t, &[Want::S(Status::LeftOnly)]), "- gone/\n");
+        let j = render_json(&t, &[Want::S(Status::Modified)]);
         assert_eq!(j, "[\n  {\"path\":\"a/x.txt\",\"status\":\"modified\",\"type\":\"file\"}\n]\n");
-        assert_eq!(render_json(&t, &[Status::RightOnly]).contains("new \\\"q\\\".txt"), true);
+        assert_eq!(render_json(&t, &[Want::S(Status::RightOnly)]).contains("new \\\"q\\\".txt"), true);
         assert_eq!(render_stat(&t), "1 modified, 1 left-only, 1 right-only, 1 identical\n");
         let _ = fs::remove_dir_all(&root);
     }
@@ -637,7 +684,7 @@ mod tests {
     #[test]
     fn empty_json() {
         let (root, t) = sample();
-        assert_eq!(render_json(&t, &[Status::Modified, Status::LeftOnly, Status::RightOnly]).lines().count() > 2, true);
+        assert_eq!(render_json(&t, &[Want::S(Status::Modified), Want::S(Status::LeftOnly), Want::S(Status::RightOnly)]).lines().count() > 2, true);
         let same = compare(&root.join("l/a"), &root.join("l/a"), &Opts::default());
         assert_eq!(render_json(&same, &[]), "[]\n");
         assert_eq!(render_tree(&same, &[]), "");

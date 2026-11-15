@@ -186,7 +186,7 @@ pub fn find_pairs(tree: &Node, left: &Path, right: &Path) -> Vec<(PathBuf, PathB
                     continue;
                 }
                 let Some(b) = &rf[&j] else { continue };
-                let s = similarity(a, b);
+                let s = similarity(a, b).min(99); // 100 is reserved for byte-identical files
                 if s >= THRESHOLD {
                     scored.push((s, affinity(&ls[i].key, &rs[j].key), i, j));
                 }

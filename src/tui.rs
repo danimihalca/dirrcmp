@@ -6,7 +6,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -56,26 +59,81 @@ pub struct Config {
     pub pair_ignore: Option<PathBuf>,
 }
 
+/// Is the mouse captured right now, and is there a real terminal to tell?
+static MOUSE_ON: AtomicBool = AtomicBool::new(false);
+static MOUSE_TTY: AtomicBool = AtomicBool::new(false);
+
+#[cfg(not(test))]
+fn emit_mouse(on: bool) {
+    use ratatui::crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+    let mut out = io::stdout();
+    let _ = if on {
+        ratatui::crossterm::execute!(out, EnableMouseCapture)
+    } else {
+        ratatui::crossterm::execute!(out, DisableMouseCapture)
+    };
+}
+
+#[cfg(test)]
+fn emit_mouse(_on: bool) {}
+
+/// Capture (or release) the mouse. Does nothing to the terminal outside `run`.
+fn set_mouse(on: bool) {
+    MOUSE_ON.store(on, AtomicOrdering::SeqCst);
+    if MOUSE_TTY.load(AtomicOrdering::SeqCst) {
+        emit_mouse(on);
+    }
+}
+
+/// Put the terminal into TUI mode (with the mouse if wanted); undone by `leave_tui`.
+fn enter_tui(mouse: bool) -> DefaultTerminal {
+    let t = ratatui::init();
+    MOUSE_TTY.store(true, AtomicOrdering::SeqCst);
+    set_mouse(mouse);
+    t
+}
+
+fn leave_tui() {
+    if MOUSE_TTY.load(AtomicOrdering::SeqCst) && MOUSE_ON.load(AtomicOrdering::SeqCst) {
+        emit_mouse(false);
+    }
+    MOUSE_TTY.store(false, AtomicOrdering::SeqCst);
+    ratatui::restore();
+}
+
+/// A crash must not leave the terminal reporting mouse events.
+fn mouse_panic_guard() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if MOUSE_TTY.load(AtomicOrdering::SeqCst) {
+            emit_mouse(false);
+        }
+        prev(info)
+    }));
+}
+
 pub fn run(cfg: Config) -> io::Result<()> {
     let mut app = App::new(cfg);
-    let mut terminal = ratatui::init();
+    mouse_panic_guard();
+    let mut terminal = enter_tui(app.prefs.mouse);
     let res = app.event_loop(&mut terminal);
-    ratatui::restore();
+    leave_tui();
     res
 }
 
 /// Two plain files: open the side-by-side editor on its own. Returns the
 /// `FileDiff` to print instead when the files can't be edited as text.
-pub fn run_files(left: PathBuf, right: PathBuf, syntax: bool, smooth: bool) -> io::Result<Option<FileDiff>> {
+pub fn run_files(left: PathBuf, right: PathBuf, syntax: bool, smooth: bool, mouse: bool) -> io::Result<Option<FileDiff>> {
     let mut view = match SideView::open(left, right, true, true) {
         Ok(v) => v,
         Err(fd) => return Ok(Some(fd)),
     };
     view.set_syntax(syntax);
     view.set_smooth(smooth);
-    let mut terminal = ratatui::init();
+    mouse_panic_guard();
+    let mut terminal = enter_tui(mouse);
     let res = file_loop(&mut terminal, &mut view);
-    ratatui::restore();
+    leave_tui();
     res.map(|_| None)
 }
 
@@ -100,13 +158,30 @@ fn file_loop(term: &mut DefaultTerminal, view: &mut SideView) -> io::Result<()> 
         // mouse-wheel flick into a burst of Up/Down keys; redrawing after each one makes the
         // view lag behind and keep scrolling after the wheel has stopped or reversed.
         loop {
-            if let Event::Key(k) = event::read()? {
-                // Ctrl-C is ignored like in the directory view: it must not drop edits.
-                if k.kind == KeyEventKind::Press {
-                    if let Outcome::Close { .. } = view.on_key(k) {
-                        return Ok(());
+            match event::read()? {
+                Event::Key(k) => {
+                    // Ctrl-C is ignored like in the directory view: it must not drop edits.
+                    if k.kind == KeyEventKind::Press {
+                        if let Outcome::Close { .. } = view.on_key(k) {
+                            return Ok(());
+                        }
                     }
                 }
+                Event::Mouse(m) => {
+                    let size = term.size()?;
+                    let area = Rect { x: 0, y: 0, width: size.width, height: size.height.saturating_sub(1) };
+                    match m.kind {
+                        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                            let code = if m.kind == MouseEventKind::ScrollUp { KeyCode::Up } else { KeyCode::Down };
+                            for _ in 0..WHEEL_LINES {
+                                let _ = view.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+                            }
+                        }
+                        MouseEventKind::Down(MouseButton::Left) => view.click(area, m.column, m.row),
+                        _ => {}
+                    }
+                }
+                _ => {}
             }
             if !event::poll(Duration::ZERO)? {
                 break;
@@ -114,6 +189,9 @@ fn file_loop(term: &mut DefaultTerminal, view: &mut SideView) -> io::Result<()> 
         }
     }
 }
+
+/// Lines moved per wheel notch.
+const WHEEL_LINES: usize = 3;
 
 /// What the key handler needs from the terminal: running an external program
 /// (so tests can drive the app without a real terminal).
@@ -129,7 +207,7 @@ impl Host for DefaultTerminal {
 
 // ───────────────────────────── types ─────────────────────────────
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Side {
     Left,
     Right,
@@ -150,13 +228,36 @@ impl Side {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// Screen areas from the last draw, used to turn clicks into actions.
+#[derive(Default, Clone, Copy)]
+struct Hits {
+    /// Outer rects of the left and right panels.
+    panels: [Rect; 2],
+    /// Outer rect of the sidebar, when shown.
+    sidebar: Option<Rect>,
+    /// The side-by-side editor.
+    editor: Rect,
+    /// The picker popup, the number of list rows it shows and the first one shown.
+    picker: Option<(Rect, usize, usize)>,
+}
+
+fn contains(r: Rect, x: u16, y: u16) -> bool {
+    x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum StatusFilter {
     All,
     Different,
     Modified,
     LeftOnly,
     RightOnly,
+    /// Any detected rename/move.
+    Renamed,
+    /// Renamed/moved, content identical.
+    Moved,
+    /// Renamed/moved and changed.
+    MovedEdited,
 }
 
 impl StatusFilter {
@@ -166,7 +267,10 @@ impl StatusFilter {
             StatusFilter::Different => StatusFilter::Modified,
             StatusFilter::Modified => StatusFilter::LeftOnly,
             StatusFilter::LeftOnly => StatusFilter::RightOnly,
-            StatusFilter::RightOnly => StatusFilter::All,
+            StatusFilter::RightOnly => StatusFilter::Renamed,
+            StatusFilter::Renamed => StatusFilter::Moved,
+            StatusFilter::Moved => StatusFilter::MovedEdited,
+            StatusFilter::MovedEdited => StatusFilter::All,
         }
     }
     fn label(self) -> &'static str {
@@ -176,15 +280,23 @@ impl StatusFilter {
             StatusFilter::Modified => "modified",
             StatusFilter::LeftOnly => "left-only",
             StatusFilter::RightOnly => "right-only",
+            StatusFilter::Renamed => "renamed/moved",
+            StatusFilter::Moved => "moved, unchanged",
+            StatusFilter::MovedEdited => "moved, changed",
         }
     }
-    fn matches(self, s: Status) -> bool {
+    fn matches(self, n: &Node) -> bool {
+        let s = n.status;
         match self {
             StatusFilter::All => true,
             StatusFilter::Different => s != Status::Same,
-            StatusFilter::Modified => s == Status::Modified,
+            // a detected rename is listed under the renamed filters, not under "modified"
+            StatusFilter::Modified => s == Status::Modified && n.rename.is_none(),
             StatusFilter::LeftOnly => s == Status::LeftOnly,
             StatusFilter::RightOnly => s == Status::RightOnly,
+            StatusFilter::Renamed => n.rename.is_some(),
+            StatusFilter::Moved => n.rename.map_or(false, |p| p >= 100),
+            StatusFilter::MovedEdited => n.rename.map_or(false, |p| p < 100),
         }
     }
 }
@@ -200,7 +312,7 @@ impl Filter {
     }
     fn matches(&self, n: &Node) -> bool {
         (self.text.is_empty() || n.name.to_lowercase().contains(&self.text))
-            && self.status.matches(n.status)
+            && self.status.matches(n)
     }
 }
 
@@ -229,20 +341,37 @@ struct Row {
     rename: Option<u8>,
 }
 
-fn flatten(nodes: &[Node], depth: usize, expanded: &HashSet<PathBuf>, f: &Filter, out: &mut Vec<Row>) {
+/// Cyan: moved with identical content; magenta: moved and changed.
+fn rename_color(p: Option<u8>) -> Color {
+    if p.map_or(true, |p| p >= 100) { Color::Cyan } else { Color::Magenta }
+}
+
+fn flatten(
+    nodes: &[Node],
+    depth: usize,
+    expanded: &HashSet<PathBuf>,
+    closed: &HashSet<PathBuf>,
+    f: &Filter,
+    out: &mut Vec<Row>,
+) {
     for n in nodes {
         if !visible(n, f) {
             continue;
         }
         let is_dir = n.is_dir();
-        // With a filter active, open directories that have matching children.
-        // A status-only filter does not open one-sided directories (everything
-        // inside them has the same status, so it would just be noise).
+        // With a filter active, directories that have matching children open by
+        // themselves, except those the user closed. A status-only filter does not
+        // open one-sided directories on its own (everything inside them has the same
+        // status, so it would just be noise), but keeps the ones the user opened.
         let exp = is_dir
             && if f.is_none() {
                 expanded.contains(&n.rel)
             } else {
-                (!f.text.is_empty() || n.status == Status::Modified)
+                !closed.contains(&n.rel)
+                    && (expanded.contains(&n.rel)
+                        || !f.text.is_empty()
+                        || n.status == Status::Modified
+                        || n.contains_rename())
                     && n.children.iter().any(|c| visible(c, f))
             };
         out.push(Row {
@@ -259,7 +388,7 @@ fn flatten(nodes: &[Node], depth: usize, expanded: &HashSet<PathBuf>, f: &Filter
             rename: n.rename,
         });
         if exp {
-            flatten(&n.children, depth + 1, expanded, f, out);
+            flatten(&n.children, depth + 1, expanded, closed, f, out);
         }
     }
 }
@@ -490,7 +619,7 @@ struct PrefsUi {
     editing: Option<String>,
 }
 
-const PREF_ROWS: usize = 10;
+const PREF_ROWS: usize = 11;
 
 struct KeysUi {
     sel: usize,
@@ -551,6 +680,10 @@ struct App {
     sb_top: usize,
     /// Terminal width at the last draw (the sidebar needs room).
     term_w: u16,
+    /// Where things were drawn last, for mouse clicks.
+    hits: Hits,
+    /// Row and time of the last click on a file (for double-click).
+    last_click: Option<(usize, Instant)>,
     /// The file open in the side-by-side editor (left-relative path).
     side_rel: Option<PathBuf>,
     keymap: Keymap,
@@ -559,6 +692,8 @@ struct App {
     tree: Node,
     journal: Journal,
     expanded: HashSet<PathBuf>,
+    /// Directories the user closed; only matters while a filter is active (it would open them).
+    closed: HashSet<PathBuf>,
     rows: Vec<Row>,
     cursor: usize,
     top: usize,
@@ -614,6 +749,8 @@ impl App {
             sb_focus: false,
             sb_top: 0,
             term_w: 100,
+            hits: Hits::default(),
+            last_click: None,
             side_rel: None,
             prefs: cfg.prefs,
             cli_dates: cfg.cli_dates,
@@ -629,6 +766,7 @@ impl App {
             tree,
             journal: Journal::new(),
             expanded,
+            closed: HashSet::new(),
             rows: Vec::new(),
             cursor: 0,
             top: 0,
@@ -663,16 +801,123 @@ impl App {
             }
             // Drain the queue before redrawing (see `file_loop`).
             loop {
-                if let Event::Key(k) = event::read()? {
-                    if k.kind == KeyEventKind::Press && self.on_key(k, term)? {
-                        return Ok(());
+                match event::read()? {
+                    Event::Key(k) => {
+                        if k.kind == KeyEventKind::Press && self.on_key(k, term)? {
+                            return Ok(());
+                        }
                     }
+                    Event::Mouse(m) => self.on_mouse(m, term)?,
+                    _ => {}
                 }
                 if !event::poll(Duration::ZERO)? {
                     break;
                 }
             }
         }
+    }
+
+    /// Mouse: the wheel moves like Up/Down (so smooth scrolling and every view work as
+    /// with the keys), a left click selects, folds, opens or places the cursor.
+    fn on_mouse(&mut self, m: MouseEvent, term: &mut dyn Host) -> io::Result<()> {
+        match m.kind {
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let scrollable = matches!(
+                    self.mode,
+                    Mode::Normal | Mode::Side(_) | Mode::Picker(_) | Mode::Diff(_) | Mode::Actions(_) | Mode::Prefs(_)
+                );
+                if scrollable {
+                    let code = if m.kind == MouseEventKind::ScrollUp { KeyCode::Up } else { KeyCode::Down };
+                    for _ in 0..WHEEL_LINES {
+                        self.on_key(KeyEvent::new(code, KeyModifiers::NONE), term)?;
+                    }
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => self.click(m.column, m.row, term)?,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn click(&mut self, x: u16, y: u16, term: &mut dyn Host) -> io::Result<()> {
+        let h = self.hits;
+        let in_editor = matches!(self.mode, Mode::Side(_))
+            || matches!(&self.mode, Mode::Picker(p) if p.back.is_some());
+        match &mut self.mode {
+            Mode::Picker(ui) if ui.back.is_none() => {
+                let Some((r, rows, start)) = h.picker else { return Ok(()) };
+                // first list row: below the top border and the query line
+                let first = r.y + 2;
+                if contains(r, x, y) && y >= first && ((y - first) as usize) < rows {
+                    let idx = start + (y - first) as usize;
+                    if idx < ui.shown.len() {
+                        ui.sel = idx;
+                        self.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), term)?;
+                    }
+                }
+            }
+            Mode::Normal => {
+                for (i, side) in [Side::Left, Side::Right].into_iter().enumerate() {
+                    let r = h.panels[i];
+                    if !contains(r, x, y) {
+                        continue;
+                    }
+                    let prev_focus = self.focus;
+                    self.focus = side;
+                    // inside the border: title row and bottom edge are not rows
+                    if y <= r.y || y + 1 >= r.y + r.height {
+                        return Ok(());
+                    }
+                    let idx = self.top + (y - r.y - 1) as usize;
+                    let Some(row) = self.rows.get(idx).cloned() else { return Ok(()) };
+                    let was_selected = self.cursor == idx && prev_focus == side;
+                    self.cursor = idx;
+                    if row.is_dir {
+                        // a directory folds when its arrow is clicked, or when it was already selected
+                        let arrow_x = r.x + 1 + (row.depth * 2) as u16;
+                        let on_arrow = x >= arrow_x && x < arrow_x + 2;
+                        self.last_click = None;
+                        if on_arrow || was_selected {
+                            self.set_open(&row.rel, !row.expanded);
+                            self.rebuild_rows();
+                        }
+                    } else {
+                        let double = self
+                            .last_click
+                            .map_or(false, |(r, t)| r == idx && t.elapsed() < Duration::from_millis(500));
+                        self.last_click = Some((idx, Instant::now()));
+                        if double {
+                            self.last_click = None;
+                            self.open_selected(term)?;
+                        }
+                    }
+                    return Ok(());
+                }
+            }
+            _ if in_editor => {
+                if let Some(sb) = h.sidebar.filter(|r| contains(*r, x, y)) {
+                    if y > sb.y && y + 1 < sb.y + sb.height {
+                        let idx = self.sb_top + (y - sb.y - 1) as usize;
+                        if idx < self.rows.len() {
+                            self.sb_focus = true;
+                            self.cursor = idx;
+                            self.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), term)?;
+                        }
+                    }
+                } else if contains(h.editor, x, y) {
+                    self.sb_focus = false;
+                    if let Mode::Side(sv) = &mut self.mode {
+                        sv.click(h.editor, x, y);
+                    } else if let Mode::Picker(ui) = &mut self.mode {
+                        if let Some(sv) = ui.back.as_mut() {
+                            sv.click(h.editor, x, y);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     fn filter(&self) -> Filter {
@@ -683,7 +928,7 @@ impl App {
         let selected = self.rows.get(self.cursor).map(|r| r.rel.clone());
         let f = self.filter();
         let mut rows = Vec::new();
-        flatten(&self.tree.children, 0, &self.expanded, &f, &mut rows);
+        flatten(&self.tree.children, 0, &self.expanded, &self.closed, &f, &mut rows);
         if let Some(sel) = selected {
             if let Some(i) = rows.iter().position(|r| r.rel == sel) {
                 self.cursor = i;
@@ -853,7 +1098,7 @@ impl App {
                 ('z', KeyCode::Char('o')) => self.fold_here(true, false),
                 ('z', KeyCode::Char('c')) => self.fold_here(false, false),
                 ('z', KeyCode::Char('a')) => {
-                    let open = self.dir_here().map_or(true, |d| !self.expanded.contains(&d));
+                    let open = self.dir_here().map_or(true, |d| !self.is_open(&d));
                     self.fold_here(open, false)
                 }
                 ('z', KeyCode::Char('i')) => self.toggle_ignore(),
@@ -1085,7 +1330,7 @@ impl App {
             if d.as_os_str().is_empty() {
                 break;
             }
-            self.expanded.insert(d.to_path_buf());
+            self.set_open(d, true);
             p = d.parent();
         }
         self.rebuild_rows();
@@ -1188,9 +1433,7 @@ impl App {
             KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter | KeyCode::Char(' ') => {
                 if let Some(row) = self.rows.get(self.cursor).cloned() {
                     if row.is_dir {
-                        if !self.expanded.remove(&row.rel) {
-                            self.expanded.insert(row.rel.clone());
-                        }
+                        self.set_open(&row.rel, !row.expanded);
                         self.rebuild_rows();
                     } else {
                         let e = FileEntry::from_row(&row);
@@ -1285,12 +1528,30 @@ impl App {
         self.cursor = (self.cursor as isize + delta).clamp(0, max) as usize;
     }
 
-    fn expand_all(&mut self, open: bool) {
-        self.expanded.clear();
+    /// Open or close one directory, remembering a close for filtered views too.
+    fn set_open(&mut self, dir: &Path, open: bool) {
         if open {
-            let mut s = HashSet::new();
-            collect_dirs(&self.tree, false, &mut s);
-            self.expanded = s;
+            self.expanded.insert(dir.to_path_buf());
+            self.closed.remove(dir);
+        } else {
+            self.expanded.remove(dir);
+            self.closed.insert(dir.to_path_buf());
+        }
+    }
+
+    fn is_open(&self, dir: &Path) -> bool {
+        self.rows.iter().find(|r| r.rel == dir).map_or(self.expanded.contains(dir), |r| r.expanded)
+    }
+
+    fn expand_all(&mut self, open: bool) {
+        let mut all = HashSet::new();
+        collect_dirs(&self.tree, false, &mut all);
+        if open {
+            self.expanded = all;
+            self.closed.clear();
+        } else {
+            self.expanded.clear();
+            self.closed = all;
         }
         self.rebuild_rows();
     }
@@ -1308,17 +1569,13 @@ impl App {
     /// `zo`/`zc` (and `zO`/`zC` with `deep`): open or close the directory under the cursor.
     fn fold_here(&mut self, open: bool, deep: bool) {
         let Some(dir) = self.dir_here() else { return };
-        if open {
-            self.expanded.insert(dir.clone());
-            if deep {
-                let mut all = HashSet::new();
-                collect_dirs(&self.tree, false, &mut all);
-                self.expanded.extend(all.into_iter().filter(|d| d.starts_with(&dir)));
+        self.set_open(&dir, open);
+        if deep {
+            let mut all = HashSet::new();
+            collect_dirs(&self.tree, false, &mut all);
+            for d in all.into_iter().filter(|d| d.starts_with(&dir)) {
+                self.set_open(&d, open);
             }
-        } else if deep {
-            self.expanded.retain(|d| !d.starts_with(&dir));
-        } else {
-            self.expanded.remove(&dir);
         }
         // closing hides the children, so the cursor goes to the directory itself
         if !open {
@@ -1330,9 +1587,8 @@ impl App {
     }
 
     fn toggle_dir(&mut self, rel: &Path) {
-        if !self.expanded.remove(rel) {
-            self.expanded.insert(rel.to_path_buf());
-        }
+        let open = self.is_open(rel);
+        self.set_open(rel, !open);
         self.rebuild_rows();
     }
 
@@ -1342,7 +1598,7 @@ impl App {
         };
         if row.is_dir {
             if !row.expanded {
-                self.expanded.insert(row.rel.clone());
+                self.set_open(&row.rel, true);
                 self.rebuild_rows();
             } else if self.rows.get(self.cursor + 1).map_or(false, |r| r.depth > row.depth) {
                 self.cursor += 1;
@@ -1357,8 +1613,8 @@ impl App {
         let Some(row) = self.rows.get(self.cursor).cloned() else {
             return;
         };
-        if row.is_dir && self.expanded.contains(&row.rel) {
-            self.expanded.remove(&row.rel);
+        if row.is_dir && row.expanded {
+            self.set_open(&row.rel, false);
             self.rebuild_rows();
             return;
         }
@@ -1785,6 +2041,10 @@ impl App {
                 format!("{} Detect renamed / moved files", mark(self.prefs.renames)),
                 if self.cli_no_renames { "--no-renames is on this run".into() } else { "like git -M: same or ≥50% similar content".into() },
             ),
+            9 => (
+                format!("{} Mouse support", mark(self.prefs.mouse)),
+                "click and wheel; off lets the terminal select text".to_string(),
+            ),
             _ => (
                 format!(
                     "    External diff command: {}",
@@ -1802,6 +2062,7 @@ impl App {
         self.nerd_font = self.prefs.nerd_font;
         self.syntax = self.prefs.syntax && !self.cli_no_syntax;
         self.chunk_bg = self.prefs.chunk_bg;
+        set_mouse(self.prefs.mouse);
         self.smooth = self.prefs.smooth;
         if !self.smooth {
             self.flush_scroll();
@@ -1819,7 +2080,7 @@ impl App {
             0 if self.cli_quick => Some("--quick"),
             1 if self.cli_dates => Some("--dates"),
             8 if self.cli_no_renames => Some("--no-renames"),
-            9 if self.cli_diff.is_some() => Some("--diff-cmd"),
+            10 if self.cli_diff.is_some() => Some("--diff-cmd"),
             _ => None,
         };
         let saved = match &self.config_file {
@@ -1840,7 +2101,7 @@ impl App {
                 KeyCode::Enter => {
                     let t = text.trim().to_string();
                     self.prefs.diff_command = if t.is_empty() { None } else { Some(t) };
-                    self.prefs_changed(9);
+                    self.prefs_changed(10);
                 }
                 KeyCode::Esc => {}
                 KeyCode::Backspace => {
@@ -1876,13 +2137,14 @@ impl App {
                     6 => self.prefs.chunk_bg = !self.prefs.chunk_bg,
                     7 => self.prefs.smooth = !self.prefs.smooth,
                     8 => self.prefs.renames = !self.prefs.renames,
+                    9 => self.prefs.mouse = !self.prefs.mouse,
                     _ => {
                         if key.code == KeyCode::Enter {
                             ui.editing = Some(self.prefs.diff_command.clone().unwrap_or_default());
                         }
                     }
                 }
-                if ui.sel < 9 {
+                if ui.sel < 10 {
                     self.prefs_changed(ui.sel);
                 }
             }
@@ -2148,6 +2410,9 @@ impl App {
         } else {
             (None, chunks[0])
         };
+        self.hits.sidebar = sb_rect;
+        self.hits.editor = main;
+        self.hits.picker = None;
         if let Some(r) = sb_rect {
             self.sb_top = sidebar_top(self.sb_top, self.cursor, r.height.saturating_sub(2) as usize);
             draw_sidebar(
@@ -2168,12 +2433,12 @@ impl App {
             if let Some(sv) = ui.back.as_mut() {
                 sv.draw(f, main);
             } else {
-                draw_panels(f, chunks[0], self);
+                self.hits.panels = draw_panels(f, chunks[0], self);
             }
         } else if let Mode::Diff(dv) = &self.mode {
             draw_diff(f, chunks[0], dv);
         } else {
-            draw_panels(f, chunks[0], self);
+            self.hits.panels = draw_panels(f, chunks[0], self);
         }
         self.draw_status(f, chunks[1]);
 
@@ -2192,7 +2457,7 @@ impl App {
                 draw_ignores(f, area, ui, &self.ignore_all.lines(), &self.pair_lines, &self.msg)
             }
             Mode::Prefs(ui) => draw_prefs(f, area, ui, self),
-            Mode::Picker(ui) => draw_picker(f, area, ui),
+            Mode::Picker(ui) => self.hits.picker = Some(draw_picker(f, area, ui)),
             Mode::Keys(ui) => draw_keys(f, area, ui, &self.keymap),
             Mode::Actions(ui) => draw_actions(f, area, ui, &self.keymap),
             Mode::Help => {
@@ -2276,7 +2541,7 @@ impl App {
                         if p >= 100 { String::new() } else { format!(" ({p}% similar)") },
                         self.focus.name()
                     ),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::REVERSED),
+                    Style::default().fg(rename_color(r.rename)).add_modifier(Modifier::REVERSED),
                 )
             }
             _ => (
@@ -2315,10 +2580,11 @@ const HELP: &str = "\
   m  M            pair / unpair dirs S    swap panels
   r               refresh            ?    this help         q  quit
   ^p              find file (fuzzy picker; Tab: changed only)
+  mouse           click select / fold / open, double-click file, wheel scroll
   .               actions menu       ,    preferences       K  key bindings
 
  Colors: yellow modified, green only on this side, red missing here, dim identical,
- cyan renamed/moved (same or similar content): R renames the focused side to match.
+ cyan moved (same content), magenta moved and changed; f cycles the filters: R renames the focused side to match.
  Directory copy merges; nothing extra is deleted from the destination.
  Pairing: press m on a file or directory that exists on one side only, Tab to the
  other panel, press m on the renamed one (same kind, same parent). They compare as one entry.
@@ -2489,7 +2755,8 @@ fn draw_sidebar(
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn draw_picker(f: &mut Frame, area: Rect, ui: &PickerUi) {
+/// Returns the popup rect, how many list rows fit and the index of the first one shown.
+fn draw_picker(f: &mut Frame, area: Rect, ui: &PickerUi) -> (Rect, usize, usize) {
     let w = area.width.saturating_sub(4).min(96);
     let h_list = (area.height.saturating_sub(6) as usize).clamp(3, 22);
     let h = (h_list as u16 + 3).min(area.height);
@@ -2544,6 +2811,7 @@ fn draw_picker(f: &mut Frame, area: Rect, ui: &PickerUi) {
     let title = format!(" Find file  {}/{} ", ui.shown.len(), ui.items.len());
     f.render_widget(Clear, r);
     f.render_widget(Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title)), r);
+    (r, h_list, start)
 }
 
 fn picker_text(base: Style, matched: bool) -> Style {
@@ -2650,7 +2918,7 @@ fn side_line(
     let rest = format!("{:<nw$} {:>rw$}", name, size_txt, nw = name_w, rw = right_w);
 
     let mut style = match (meta.is_some(), row.status) {
-        (true, _) if row.rename.is_some() => Style::default().fg(Color::Cyan),
+        (true, _) if row.rename.is_some() => Style::default().fg(rename_color(row.rename)),
         (false, _) => Style::default().fg(Color::Red),
         (true, Status::Same) => Style::default().fg(Color::Gray),
         (true, Status::Modified) => Style::default().fg(Color::Yellow),
@@ -2680,7 +2948,7 @@ fn side_line(
     Line::from(Span::styled(format!("{prefix}{rest}"), style))
 }
 
-fn draw_panels(f: &mut Frame, area: Rect, app: &App) {
+fn draw_panels(f: &mut Frame, area: Rect, app: &App) -> [Rect; 2] {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -2713,6 +2981,7 @@ fn draw_panels(f: &mut Frame, area: Rect, app: &App) {
         };
         f.render_widget(Paragraph::new(lines).block(block), cols[i]);
     }
+    [cols[0], cols[1]]
 }
 
 fn draw_ignores(
@@ -2893,9 +3162,10 @@ fn run_external(term: &mut DefaultTerminal, cmd: &str, paths: &[&Path]) -> io::R
         return Ok("empty command".to_string());
     };
     let args: Vec<&str> = parts.collect();
-    ratatui::restore();
+    let mouse = MOUSE_ON.load(AtomicOrdering::SeqCst);
+    leave_tui();
     let status = Command::new(prog).args(&args).args(paths).status();
-    *term = ratatui::init();
+    *term = enter_tui(mouse);
     term.clear()?;
     Ok(match status {
         Ok(s) if s.success() => format!("{prog} finished"),
@@ -3072,6 +3342,155 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    fn click_at(app: &mut App, x: u16, y: u16) {
+        let m = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: x, row: y, modifiers: KeyModifiers::NONE };
+        app.on_mouse(m, &mut Rec::default()).unwrap();
+    }
+
+    fn wheel(app: &mut App, up: bool) {
+        let kind = if up { MouseEventKind::ScrollUp } else { MouseEventKind::ScrollDown };
+        let m = MouseEvent { kind, column: 5, row: 5, modifiers: KeyModifiers::NONE };
+        app.on_mouse(m, &mut Rec::default()).unwrap();
+    }
+
+    #[test]
+    fn mouse_click_wheel_and_double_click_in_the_tree() {
+        let (root, mut app) = basic();
+        // panels as drawn: left x 0..40, right x 40..80, rows start one line below the border
+        app.hits.panels = [
+            Rect { x: 0, y: 0, width: 40, height: 20 },
+            Rect { x: 40, y: 0, width: 40, height: 20 },
+        ];
+        assert_eq!(app.cursor, 0);
+        let n = app.rows.len();
+        assert!(n >= 4);
+        // click the 3rd row in the right panel: selects it and focuses that panel
+        click_at(&mut app, 50, 3);
+        assert_eq!((app.cursor, app.focus), (2, Side::Right));
+        click_at(&mut app, 10, 2);
+        assert_eq!((app.cursor, app.focus), (1, Side::Left));
+        // the border / title row and rows below the list do nothing but focus
+        click_at(&mut app, 10, 0);
+        assert_eq!(app.cursor, 1);
+        click_at(&mut app, 10, 15);
+        assert_eq!(app.cursor, 1);
+        // wheel: three rows per notch, clamped
+        app.cursor = 0;
+        wheel(&mut app, false);
+        assert_eq!(app.cursor, 3.min(n - 1));
+        wheel(&mut app, true);
+        assert_eq!(app.cursor, 0);
+        // a directory toggles on click; a file needs a double click to open
+        let d = app.rows.iter().position(|r| r.is_dir).unwrap();
+        let before = app.rows.len();
+        let was_open = app.rows[d].expanded;
+        let depth = app.rows[d].depth as u16;
+        app.cursor = if d == 0 { 1 } else { 0 };
+        click_at(&mut app, 30, d as u16 + 1); // first click only selects
+        assert_eq!((app.cursor, app.rows.len(), app.rows[d].expanded), (d, before, was_open));
+        click_at(&mut app, 30, d as u16 + 1); // already selected: folds
+        assert_ne!(app.rows.len(), before, "directory folded/unfolded");
+        assert_eq!(app.rows[d].expanded, !was_open);
+        // the arrow folds without selecting first
+        app.cursor = if d == 0 { 1 } else { 0 };
+        click_at(&mut app, 1 + depth * 2, d as u16 + 1);
+        assert_eq!((app.cursor, app.rows[d].expanded), (d, was_open));
+        // the right panel's arrow works the same, in its own column range
+        click_at(&mut app, 40 + 1 + depth * 2 + 1, d as u16 + 1);
+        assert_eq!(app.rows[d].expanded, !was_open);
+        click_at(&mut app, 40 + 1 + depth * 2, d as u16 + 1);
+        assert_eq!(app.rows[d].expanded, was_open);
+        let f = app.rows.iter().position(|r| !r.is_dir && r.status != Status::Same).unwrap();
+        click_at(&mut app, 10, f as u16 + 1);
+        assert!(matches!(app.mode, Mode::Normal), "one click only selects");
+        click_at(&mut app, 10, f as u16 + 1);
+        assert!(matches!(app.mode, Mode::Side(_)), "double click opens the editor");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mouse_in_the_picker_the_sidebar_and_the_editor() {
+        let (root, mut app) = basic();
+        app.hits.panels = [Rect { x: 0, y: 0, width: 40, height: 20 }, Rect { x: 40, y: 0, width: 40, height: 20 }];
+        ctrl(&mut app, 'p');
+        assert!(matches!(app.mode, Mode::Picker(_)));
+        // popup at (10,5), list rows start two below its top edge, 8 rows fit, none scrolled
+        app.hits.picker = Some((Rect { x: 10, y: 5, width: 60, height: 12 }, 8, 0));
+        let target = match &app.mode {
+            Mode::Picker(ui) => ui.items[ui.shown[1].0].rel.clone(),
+            _ => unreachable!(),
+        };
+        click_at(&mut app, 20, 5); // border: nothing
+        assert!(matches!(app.mode, Mode::Picker(_)));
+        click_at(&mut app, 20, 5 + 2 + 1); // second entry
+        assert!(matches!(app.mode, Mode::Side(_)), "click opens the entry");
+        assert_eq!(app.side_rel.as_ref(), Some(&target));
+        // editor: click puts the cursor on that line in that pane
+        app.hits.editor = Rect { x: 0, y: 0, width: 80, height: 20 };
+        app.hits.sidebar = None;
+        wheel(&mut app, false);
+        click_at(&mut app, 60, 1);
+        assert!(matches!(app.mode, Mode::Side(_)));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn folds_survive_filtering_and_rename_filters() {
+        let root = tmp();
+        let (l, r) = (root.join("l"), root.join("r"));
+        let body: String = (0..10).map(|i| format!("line {i} of the text\n")).collect();
+        let edited = body.replace("line 3 of", "line three of");
+        put(l.join("d/a.txt"), "1\n");
+        put(r.join("d/a.txt"), "2\n");
+        put(l.join("d/b.txt"), "1\n");
+        put(r.join("d/b.txt"), "2\n");
+        put(l.join("e/c.txt"), "1\n");
+        put(r.join("e/c.txt"), "2\n");
+        put(l.join("m/pure.txt"), &body);
+        put(r.join("n/moved.txt"), &body);
+        let other: String = (0..10).map(|i| format!("another {i} text\n")).collect();
+        put(l.join("m/ed.txt"), &other);
+        put(r.join("n/ed2.txt"), &other.replace("another 4 text", "changed 4"));
+        let _ = edited;
+        let mut cfg = cfg_for(&root, None, Keymap::default(), false);
+        cfg.prefs.renames = true;
+        let mut app = App::new(cfg);
+        // close d in the plain view, then filter: it stays closed, e (not closed) stays open
+        select(&mut app, "d");
+        keys(&mut app, "h");
+        assert!(!names(&app).contains(&"a.txt".to_string()));
+        keys(&mut app, "f"); // different
+        assert!(!names(&app).contains(&"a.txt".to_string()), "closed dir stays closed: {:?}", names(&app));
+        assert!(names(&app).contains(&"c.txt".to_string()));
+        keys(&mut app, "f"); // modified (renames are not "modified")
+        assert!(!names(&app).contains(&"moved.txt".to_string()));
+        assert!(!names(&app).contains(&"a.txt".to_string()));
+        // opening it again under the filter sticks while cycling
+        select(&mut app, "d");
+        keys(&mut app, "l");
+        assert!(names(&app).contains(&"a.txt".to_string()));
+        keys(&mut app, "f"); // left-only
+        keys(&mut app, "f"); // right-only
+        keys(&mut app, "f"); // renamed/moved
+        assert_eq!(app.status_filter, StatusFilter::Renamed);
+        assert!(names(&app).contains(&"moved.txt".to_string()) && names(&app).contains(&"ed2.txt".to_string()));
+        assert!(!names(&app).contains(&"c.txt".to_string()));
+        keys(&mut app, "f"); // moved, unchanged
+        assert_eq!(app.status_filter, StatusFilter::Moved);
+        assert!(names(&app).contains(&"moved.txt".to_string()) && !names(&app).contains(&"ed2.txt".to_string()));
+        keys(&mut app, "f"); // moved, changed
+        assert_eq!(app.status_filter.label(), "moved, changed");
+        assert!(names(&app).contains(&"ed2.txt".to_string()) && !names(&app).contains(&"moved.txt".to_string()));
+        // zM under a filter closes everything and zR opens it again
+        keys(&mut app, "zM");
+        assert!(!names(&app).contains(&"ed2.txt".to_string()));
+        keys(&mut app, "zR");
+        assert!(names(&app).contains(&"ed2.txt".to_string()));
+        // pure moves and edited moves have different colours
+        assert_ne!(rename_color(Some(100)), rename_color(Some(80)));
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn folding_here_and_shift_keys() {
         let root = tmp();
@@ -3169,7 +3588,7 @@ mod tests {
 
         keys(&mut app, "f"); // different only
         assert_eq!(names(&app), vec!["a", "x.txt", "gone", "new.txt"]);
-        keys(&mut app, "ffff");
+        keys(&mut app, "fffffff");
         assert!(app.status_filter == StatusFilter::All);
 
         keys(&mut app, "s");
@@ -3974,6 +4393,9 @@ mod tests {
         keys(&mut app, "j ");
         assert!(app.opts.detect_renames && app.prefs.renames);
         assert!(config::load_from(&file).0.renames);
+
+        keys(&mut app, "j ");
+        assert!(!app.prefs.mouse && !config::load_from(&file).0.mouse);
 
         // external diff command: Enter edits, typing, Enter saves
         keys(&mut app, "j");

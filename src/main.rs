@@ -69,7 +69,7 @@ fn run() -> i32 {
         if matches!(c.cmd, Command::Tui) && std::io::stdout().is_terminal() {
             let prefs = config::load().0;
             let syntax = prefs.syntax && !c.no_syntax;
-            match tui::run_files(left.clone(), right.clone(), syntax, prefs.smooth) {
+            match tui::run_files(left.clone(), right.clone(), syntax, prefs.smooth, prefs.mouse) {
                 Ok(None) => return 0,
                 Ok(Some(fd)) => {
                     print!("{}", cli::render_file_diff(&fd, &left, &right));

@@ -222,6 +222,27 @@ impl SideView {
         }
     }
 
+    /// A left click at terminal cell (`x`, `y`) while the view is drawn in `area`:
+    /// focus the pane and put the cursor on that line.
+    pub fn click(&mut self, area: Rect, x: u16, y: u16) {
+        if !matches!(self.mode, Mode::Normal) || y <= area.y || y + 1 >= area.y + area.height {
+            return;
+        }
+        self.flush_scroll();
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(area);
+        if x < area.x || x >= area.x + area.width {
+            return;
+        }
+        let pos = self.top + (y - area.y - 1) as usize;
+        if let Some(Disp::Row(i)) = self.disp.get(pos) {
+            self.cursor = *i;
+            self.active = if x >= cols[1].x { Pane::Right } else { Pane::Left };
+        }
+    }
+
     pub fn scroll_active(&self) -> bool {
         self.scroller.active()
     }
@@ -1046,6 +1067,26 @@ mod tests {
 
     fn kind_at(v: &SideView, pane: Pane, line: usize, ch: usize) -> Kind {
         v.kinds(pane, line).map(|k| k[ch]).unwrap_or(Kind::Plain)
+    }
+
+    #[test]
+    fn clicking_places_the_cursor_and_picks_the_pane() {
+        let (root, mut v) = rs_view("a\nb\nc\nd\n", "a\nB\nc\nd\n");
+        let area = Rect { x: 0, y: 2, width: 80, height: 12 };
+        // rows start one line below the top border (y = 2 + 1)
+        v.click(area, 10, 5);
+        assert_eq!((v.cursor, v.active), (2, Pane::Left));
+        v.click(area, 70, 4);
+        assert_eq!((v.cursor, v.active), (1, Pane::Right));
+        // the border lines and cells outside do nothing
+        v.click(area, 10, 2);
+        v.click(area, 10, 13);
+        v.click(area, 90, 5);
+        assert_eq!((v.cursor, v.active), (1, Pane::Right));
+        // a row past the end of the file does nothing
+        v.click(area, 10, 9);
+        assert_eq!(v.cursor, 1);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
